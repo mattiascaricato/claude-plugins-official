@@ -1367,7 +1367,8 @@
       "category": "productivity",
       "source": {
         "source": "url",
-        "url": "https://github.com/gopigment/ai-plugins.git"
+        "url": "https://github.com/gopigment/ai-plugins.git",
+        "sha": "5bdf088652ef9d2065cf25e2e42df9b19a1486e1"
       },
       "homepage": "https://www.pigment.com"
     },
