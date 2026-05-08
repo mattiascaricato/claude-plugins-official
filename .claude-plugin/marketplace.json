@@ -368,6 +368,11 @@
     {
       "name": "cds-mcp",
       "description": "AI-assisted development of SAP Cloud Application Programming Model (CAP) projects. Search CDS models and CAP documentation.",
+      "author": {
+        "name": "SAP SE",
+        "email": "ospo@sap.com",
+        "url": "https://www.sap.com"
+      },
       "category": "development",
       "source": {
         "source": "url",
@@ -1676,6 +1681,22 @@
         "sha": "bc09fa9854507c538a856648aafbd4e1a775a95c"
       },
       "homepage": "https://www.sanity.io"
+    },
+    {
+      "name": "sap-cds-mcp",
+      "description": "AI-assisted development of SAP Cloud Application Programming Model (CAP) projects. Search CDS models and CAP documentation.",
+      "author": {
+        "name": "SAP SE",
+        "email": "ospo@sap.com",
+        "url": "https://www.sap.com"
+      },
+      "category": "development",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/cap-js/mcp-server.git",
+        "sha": "8ce2e13ac70bd78415aedeaab0061af9396d3372"
+      },
+      "homepage": "https://cap.cloud.sap/"
     },
     {
       "name": "sap-fiori-mcp-server",
