@@ -1336,6 +1336,20 @@
       "homepage": "https://jfrog.com"
     },
     {
+      "name": "knowledge-catalog",
+      "description": "Connect to Knowledge Catalog to discover, manage, monitor, and govern data and AI artifacts across your data platform",
+      "author": {
+        "name": "Google LLC"
+      },
+      "category": "database",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/gemini-cli-extensions/knowledge-catalog.git",
+        "sha": "317e96fdd12aa61778b950192aff627efdc21099"
+      },
+      "homepage": "https://github.com/gemini-cli-extensions/knowledge-catalog"
+    },
+    {
       "name": "kotlin-lsp",
       "description": "Kotlin language server for code intelligence",
       "version": "1.0.0",
