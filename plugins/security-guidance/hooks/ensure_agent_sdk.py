@@ -40,6 +40,15 @@ BUILD_FAILED = 3     # venv create or pip install raised/timed out
 SKIP_SENTINEL = 5    # another SessionStart is currently building
 HOOK_PY_INCOMPATIBLE = 6  # hook interpreter is <3.10 — SDK syntax can't load
                           # here no matter how the venv was built. See #2071.
+# --target fallback: when `python -m venv` can't bootstrap pip (ensurepip
+# missing — Debian python3-venv not installed, or a python.org/pyenv build
+# without ensurepip), fall back to `pip install --target <dir>` which needs
+# only the system pip, not venv/ensurepip. Telemetry (v2.0.4 sdk_has_pip
+# probe) confirmed ~95% of venv_ensurepip_fail users HAVE pip, so this
+# recovers the agentic reviewer for them instead of degrading to pattern +
+# single-shot review. See #2154 follow-up.
+BUILT_TARGET = 7     # venv ensurepip failed → SDK pip-installed via --target
+NOOP_TARGET = 8      # --target libs already present and importable
 
 
 # Phase + err-kind integer encoding for sdk_bootstrap_phase / sdk_bootstrap_err.
@@ -63,6 +72,7 @@ SDK_BOOTSTRAP_PHASE_CODES = {
     "venv": 2,  # python -m venv --clear
     "pip":  3,  # pip install
     "main": 4,  # uncaught exception above main()
+    "pip_target": 5,  # `pip install --target` fallback (venv ensurepip failed)
 }
 SDK_BOOTSTRAP_ERR_CODES = {
     "pip_no_match":         1,
@@ -242,6 +252,96 @@ def _probe_has_pip() -> bool:
         return False
 
 
+def _pip_err_from_stderr(stderr_b):
+    """Categorize a pip-install stderr into a known err_kind (the pip subset
+    of SDK_BOOTSTRAP_ERR_CODES). Used by the --target fallback; mirrors the
+    pip branches of main()'s inline categorizer. Kept as a sibling rather
+    than extracting main()'s chain (which also has venv-phase branches) to
+    avoid disturbing the working venv categorization."""
+    if isinstance(stderr_b, bytes):
+        s = stderr_b.decode("utf-8", errors="replace")
+    else:
+        s = str(stderr_b or "")
+    low = s.lower()
+    if "no matching distribution" in low or "could not find a version" in low:
+        return "pip_no_match"
+    if ("name or service not known" in low or "name resolution" in low
+            or "nodename nor servname" in low or "temporary failure in name" in low):
+        return "dns_fail"
+    if "connection refused" in low or "connection reset" in low:
+        return "conn_refused"
+    if "ssl" in low and ("verify" in low or "certificate" in low):
+        return "ssl_verify"
+    if "permission denied" in low or "read-only file system" in low:
+        return "perm_denied"
+    if "no module named pip" in low or "no module named ensurepip" in low:
+        return "no_pip"
+    if "no space left" in low or "disk quota" in low:
+        return "disk_full"
+    if "proxy" in low and ("authent" in low or "tunnel" in low or "407" in low):
+        return "proxy_auth"
+    if "timeout" in low or "timed out" in low:
+        return "stderr_timeout"
+    tail = next((ln.strip() for ln in reversed(s.splitlines()) if ln.strip()), "")[:60]
+    return f"other:{tail}" if tail else "other"
+
+
+def _target_dir(state_dir) -> Path:
+    return Path(state_dir) / "agent-sdk-libs"
+
+
+def _target_sdk_importable(state_dir) -> bool:
+    """True iff the --target libs dir has an importable claude_agent_sdk,
+    probed with THIS interpreter (the one llm.py will import it from) and the
+    target dir prepended to sys.path. Cheap dir-check first to avoid a
+    subprocess on the common no-target path."""
+    target = _target_dir(state_dir)
+    if not (target / "claude_agent_sdk").is_dir():
+        return False
+    try:
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); import claude_agent_sdk",
+             str(target)],
+            capture_output=True, timeout=10,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _build_via_target(state_dir) -> tuple[int, str, str]:
+    """Fallback install when `python -m venv` can't bootstrap pip (ensurepip
+    missing — Debian python3-venv absent, or a python.org/pyenv build without
+    ensurepip). `pip install --target <dir>` needs only the system pip, not
+    venv/ensurepip. v2.0.4 telemetry (sdk_has_pip) confirmed ~95% of
+    venv_ensurepip_fail users have pip. The consumer (llm.py) adds this flat
+    dir to sys.path. Returns (outcome, err_phase, err_kind).
+
+    --upgrade so a stale/partial target dir from a prior failed attempt
+    doesn't make pip refuse; --prefer-binary mirrors the venv path's wheel
+    preference (ARM64 Windows cryptography)."""
+    target = _target_dir(state_dir)
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install",
+             "--target", str(target), "--upgrade",
+             "--disable-pip-version-check", "--prefer-binary",
+             "claude-agent-sdk"],
+            capture_output=True, timeout=120, check=True,
+        )
+        return BUILT_TARGET, "", ""
+    except subprocess.CalledProcessError as e:
+        return BUILD_FAILED, "pip_target", _pip_err_from_stderr(e.stderr)
+    except subprocess.TimeoutExpired:
+        return BUILD_FAILED, "pip_target", "subprocess_timeout"
+    except Exception as e:
+        errno = getattr(e, "errno", None)
+        if isinstance(errno, int):
+            return BUILD_FAILED, "pip_target", f"exc:{type(e).__name__}:{errno}"
+        return BUILD_FAILED, "pip_target", f"exc:{type(e).__name__}"
+
+
 def _sdk_on_syspath() -> bool:
     # find_spec is ~10ms; actually importing the SDK pulls in
     # transitive deps and costs ~800ms — too heavy for a
@@ -329,6 +429,12 @@ def main() -> tuple[int, str, str]:
                 return NOOP_VENV, "", ""
         except Exception:
             pass  # broken venv; rebuild below
+
+    # If a prior run installed the SDK via the --target fallback (ensurepip
+    # path), reuse it. Only reached when there's no working venv, so healthy
+    # NOOP_VENV users never pay for this probe.
+    if _target_sdk_importable(state_dir):
+        return NOOP_TARGET, "", ""
 
     err_phase = ""
     err_kind = ""
@@ -444,6 +550,16 @@ def main() -> tuple[int, str, str]:
                 "",
             )[:60]
             err_kind = f"other:{tail}" if tail else "other"
+        # venv couldn't bootstrap pip (ensurepip missing) but pip itself may
+        # work — fall back to a flat `pip install --target`. Only this one
+        # category falls through; every other venv/pip failure is terminal.
+        # The finally block unlinks our sentinel first (so the target build
+        # isn't blocked by it); _build_via_target does the target install.
+        if err_kind == "venv_ensurepip_fail":
+            if we_own_sentinel:
+                sentinel.unlink(missing_ok=True)
+                we_own_sentinel = False
+            return _build_via_target(state_dir)
         return BUILD_FAILED, err_phase, err_kind
     except subprocess.TimeoutExpired:
         return BUILD_FAILED, err_phase, "subprocess_timeout"
