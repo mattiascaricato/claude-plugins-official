@@ -8,6 +8,12 @@ on:
       - '*/agents/**'
       - '*/skills/**'
       - '*/commands/**'
+      # `validate` is a required status check, so a PR that touches ONLY workflow
+      # files (e.g. an action-SHA re-pin) would otherwise never trigger validate
+      # and sit "Expected — Waiting for status to be reported" forever (workflow_dispatch
+      # check runs aren't associated with the PR, so they don't satisfy it). Run
+      # validate on workflow changes too so those PRs can clear the gate in-context.
+      - '.github/workflows/**'
   push:
     branches: [main]
     paths:
