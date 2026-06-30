@@ -1462,7 +1462,11 @@
     },
     {
       "name": "idmp-plugin",
-      "description": "idmp-plugin",
+      "description": "TDengine IDMP plugin with packaged skills for discovery, schema inspection, and safe operational workflows.",
+      "author": {
+        "name": "TaosData",
+        "email": "it@taosdata.com"
+      },
       "category": "development",
       "source": {
         "source": "git-subdir",
