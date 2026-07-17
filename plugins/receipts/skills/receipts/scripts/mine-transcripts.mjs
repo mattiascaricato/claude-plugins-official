@@ -31,13 +31,46 @@ function parseArgs(argv) {
   return out;
 }
 
+// A local YYYY-MM-DD calendar date. This is the unit the whole report counts
+// in: active days, the window, and git's own --date=short all key off it.
+function localDay(d) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// Local midnight N days back, by CALENDAR arithmetic. Subtracting N*86400000
+// assumes every day is 24h, which is false across a DST boundary — it lands an
+// hour early and can slip `since` onto the previous date.
+function midnightDaysAgo(from, n) {
+  const d = new Date(from);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - n);
+  return d;
+}
+
+// Distinct local dates in [from, to] inclusive — the denominator of "active on
+// N of M days". Counting elapsed milliseconds instead answers a different
+// question: `--days 7` spans 8 calendar dates, so a daily user could be
+// "active on 8 of 7 days".
+function calendarDaysBetween(from, to) {
+  const a = new Date(from); a.setHours(0, 0, 0, 0);
+  const b = new Date(to); b.setHours(0, 0, 0, 0);
+  let n = 0;
+  for (const d = a; d <= b; d.setDate(d.getDate() + 1)) n++;
+  return Math.max(1, n);
+}
+
 const args = parseArgs(process.argv.slice(2));
 const now = new Date();
 // Local midnight, not UTC — `--since 2026-07-01` means that date on the dev's
 // calendar, and active days and git commits are both keyed locally too.
+// `--days 30` means the last 30 calendar days INCLUDING today — so the floor
+// is midnight 29 days back, and the window spans exactly 30 dates. Going back
+// a full 30 spans 31, which is how a daily user ends up "active on 31 of 30
+// days".
 const cutoff = args.since
   ? new Date(args.since + 'T00:00:00')
-  : new Date(now.getTime() - args.days * 86400000);
+  : midnightDaysAgo(now, Math.max(0, args.days - 1));
 
 // Fail loudly on a bad window. An unparseable date makes `cutoff` NaN, and
 // every `ts < cutoff` test then reads false — so the run would silently scan
@@ -75,33 +108,26 @@ function countLines(s) {
   return s.split('\n').length;
 }
 
-// Bucket a tool/MCP name into a handful of human categories, weighted by
-// relative token cost (see RELATIVE_TOKEN_WEIGHTS), for the "where the spend
-// went" breakdown. Grouping happens here so raw tool names — which enumerate
-// the dev's connected services — never reach the report.
-function categoryForTool(tool) {
-  const CODE = new Set(['Edit', 'MultiEdit', 'Write', 'NotebookEdit']);
-  const SHELL = new Set(['Bash', 'BashOutput', 'KillShell']);
-  const RESEARCH = new Set([
-    'Read', 'Grep', 'Glob', 'WebSearch', 'WebFetch', 'Skill', 'AskUserQuestion',
-    'TodoWrite', 'ExitPlanMode', 'SlashCommand',
-  ]);
-  const DELEGATED = new Set(['Agent', 'Task']);
-  if (CODE.has(tool)) return 'Writing & editing code';
-  if (SHELL.has(tool)) return 'Running & verifying (shell)';
-  if (DELEGATED.has(tool) || /^Task/.test(tool)) return 'Delegated / automated work';
-  if (RESEARCH.has(tool)) return 'Reading & research';
-  if (tool.startsWith('mcp__')) {
-    const low = tool.toLowerCase();
-    if (/(send|create_draft|draft|post|upload|update|copy|delete|reply|schedule_message|authenticate)/.test(low)) {
-      return 'Collaboration (Slack, email, docs, etc.)';
-    }
-    return 'Reading & research';
-  }
-  // Anything else — a tool this script doesn't know, from a newer build or a
-  // plugin — reads as research rather than being miscredited to delegation.
-  return 'Reading & research';
-}
+// There is deliberately no "delegated" category. Delegation is a mechanism,
+// not a kind of work: a subagent that spends an hour editing a repo did an
+// hour of editing, and that is what the dev paid for. Its cost lands in the
+// activity it performed and the project it performed it on, same as any other
+// work. Spawning one costs almost nothing and is not worth a row.
+// There is deliberately no per-activity breakdown of spend.
+//
+// It's tempting — "38% of your compute went to reading code" reads like insight.
+// But a turn's cost is ~90% context handling, and half of that is re-reading
+// what earlier turns put there. Charging it to whichever tool happened to fire
+// on that turn is a modeling choice, not a measurement, and the choice decides
+// the answer: on one real month, web search came out at 11%, 28% or 51% of
+// spend depending on which defensible weighting you picked. Three reasonable
+// definitions, three different headlines, nothing in the data to arbitrate.
+//
+// Per-PROJECT spend survives that test — the ranking is invariant and the
+// numbers move a few points at most — because it divides a real quantity (a
+// session's whole cost) by a real fact (which project the session served),
+// rather than by which tool fired when. So the report keeps `pctSpend` and
+// says nothing about activity mix.
 
 // A command starts at the beginning of a line or after a shell separator —
 // `;`, `&&`, `||`, `|`, or a `then`/`do`/`else` keyword. Requiring one of
@@ -110,23 +136,80 @@ function categoryForTool(tool) {
 // (The `m` flag is what makes multi-line blocks work.)
 const CMD_START = String.raw`(?:^\s*|[;&|]\s*|\s&&\s*|\b(?:then|do|else)\s+)`;
 
-// Tokens allowed between `git` and its subcommand: options, plus the value of
-// the options that take a separate one (whose values hold `/` and `=`, so
-// they can't be matched as a plain word class). Bare words are deliberately
-// NOT allowed — they'd be a different subcommand, and `git cat-file commit
-// HEAD` is not a commit.
-const GIT_OPTS = String.raw`(?:(?:-C|-c|--git-dir|--work-tree|--exec-path|--namespace)\s+\S+\s+|--?\S+\s+)*`;
-
-// (?=\s|$) rather than \b — \b would also match "commit-tree"/"commit-graph".
-const CMD_GIT_COMMIT = new RegExp(CMD_START + String.raw`git\s+` + GIT_OPTS + String.raw`commit(?=\s|$)`, 'm');
+// There is no `git commit` counter.
+//
+// A Bash tool call carries no working directory, so a commit made in a
+// throwaway fixture repo under the agent's own scratchpad is indistinguishable
+// from one made in the dev's project — and gets credited to whatever project
+// the session was mainly working on. Measured on one real month: 33 commit
+// commands counted, 4 real commits, the other 29 made by test fixtures in
+// /tmp. It can't be filtered (there's no path to test) and nothing in the
+// report reads it, so it isn't collected. Commits are counted where they can
+// be checked: against git, in `commitsWithOurWork`.
+//
+// `gh pr create` survives because a PR needs a real remote, so it can't be
+// faked in a scratch repo — verified 3/3 real on the same corpus.
 const CMD_GH_PR_CREATE = new RegExp(CMD_START + String.raw`gh\s+pr\s+create(?=\s|$)`, 'm');
 
+// Heredoc bodies are DATA, not commands — and `^` under the `m` flag can't
+// tell the difference. Writing a deploy script, a CI workflow or a test
+// fixture that contains the words `git commit` is routine, and every such line
+// counted as a commit the dev made: on one real repo this reported 33 commit
+// commands against 2 actual commits, because the session had been writing
+// fixtures about git. Blank the bodies before matching.
+function stripHeredocs(cmd) {
+  if (!cmd.includes('<<')) return cmd;
+  return cmd.replace(
+    /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1[\s\S]*?^\s*\2\s*$/gm,
+    '<<HEREDOC'
+  );
+}
+function runsCommand(re, cmd) {
+  return re.test(stripHeredocs(cmd));
+}
+
 // Relative weights between token types, derived from the ratios between
-// published per-token rates (output tokens cost ~5x input; cache writes
-// ~1.25x; cache reads ~0.1x). These are RATIOS used only to weight "where the
-// spend went" across activity categories — never converted to a dollar
-// figure, since that would imply a precision (and a real bill) we can't back.
-const RELATIVE_TOKEN_WEIGHTS = { input: 1, output: 5, cacheCreation: 1.25, cacheRead: 0.1 };
+// published per-token rates (output ~5x input; cache writes ~1.25x, or 2x at
+// the 1-hour TTL; cache reads ~0.1x). RATIOS only — never converted to a
+// dollar figure, which would imply a precision, and a real bill, we can't back.
+// The 1h/5m distinction matters: on a real corpus the two are near an even
+// split, so reading only the flattened cache total underprices half the writes
+// by 60%.
+//
+// These feed exactly one number: each project's share of spend
+// (`byRepo[].pctSpend`). Nothing else reads them.
+//
+// One caveat the table can't fix: the ratios hold WITHIN a model, but the
+// script doesn't read `message.model`, so a cheap model's token and an
+// expensive one's weigh the same. Mixing models moves a project's share by a
+// few points. Correcting it would mean shipping a per-model price table in a
+// public plugin, which goes stale silently and is the same false precision the
+// no-dollar-figures rule exists to avoid. A share is a shape, not a bill.
+const RELATIVE_TOKEN_WEIGHTS = {
+  input: 1,
+  output: 5,
+  cacheCreation: 1.25, // 5-minute TTL
+  cacheCreation1h: 2,
+  cacheRead: 0.1,
+};
+
+// Weight one response's usage. Prefers the itemized cache_creation breakdown
+// when present and falls back to the flattened total.
+function weighUsage(u) {
+  const w = RELATIVE_TOKEN_WEIGHTS;
+  const cc = u.cache_creation || null;
+  const c1h = cc ? cc.ephemeral_1h_input_tokens || 0 : 0;
+  const c5m = cc
+    ? cc.ephemeral_5m_input_tokens || 0
+    : u.cache_creation_input_tokens || 0;
+  return (
+    (u.input_tokens || 0) * w.input +
+    (u.output_tokens || 0) * w.output +
+    c5m * w.cacheCreation +
+    c1h * w.cacheCreation1h +
+    (u.cache_read_input_tokens || 0) * w.cacheRead
+  );
+}
 
 function freshAgg() {
   return {
@@ -135,62 +218,262 @@ function freshAgg() {
     activeDays: new Set(),
     filesTouched: new Set(),
     linesTouched: 0,
-    gitCommitCmds: 0,
     prCreateCmds: 0,
     costWeight: 0, // relative compute weight (unitless, see RELATIVE_TOKEN_WEIGHTS) — used for byRepo pctSpend
   };
 }
 
 const overall = freshAgg();
-overall.categoryCost = {}; // category label -> relative weight (unitless)
 overall.firstSeen = null;
 overall.lastSeen = null;
 
-// Tracks, per session, the category of the most recent tool call — so a
-// text-only turn (Claude thinking/writing a response, no further tool use)
-// gets folded into whatever activity it's wrapping up, rather than its own
-// "thinking" bucket.
-const lastCategoryBySession = new Map();
-const DEFAULT_CATEGORY = 'Reading & research'; // fallback for a session's first turn(s), before any tool call
+const byRepo = {}; // projectName -> { ...freshAgg(), cwd: Set }
 
-const byRepo = {}; // repoName -> { ...freshAgg(), cwd: Set }
+// --- Project resolution -----------------------------------------------------
+//
+// A "project" is where work landed, not where the shell happened to be sitting.
+// Everything the report counts maps to one: a git repository, or the directory
+// a file lives in when it's outside a repo. Work outside a repo is still work —
+// it just gets named for its directory rather than dropped.
+//
+// Claude Code's own machinery is not work. The agent's scratchpad, its
+// per-session tool-results, and ~/.claude internals are the tool's bookkeeping;
+// counting them credits the dev with files Claude wrote to talk to itself.
+const HOME = os.homedir();
 
-function getRepo(cwd) {
-  const name = cwd ? path.basename(cwd) : 'unknown';
-  if (!byRepo[name]) {
-    byRepo[name] = { ...freshAgg(), cwd: new Set() };
+// Work that isn't in a project and isn't pretending to be. Sessions that
+// searched the web, read Slack, or queried a dashboard without touching a file
+// land here. For a lot of people this is the biggest row in the report, and
+// that is a true and useful thing to learn about your own usage.
+const NO_PROJECT = 'Research & investigation (no project)';
+
+// Every path comparison in this file goes through here first.
+//
+// Windows mixes separators — transcripts carry `C:\Users\...` while
+// `git rev-parse --show-toplevel` answers `C:/Users/...` — and its filesystem
+// is case-insensitive. Comparing raw strings means every check below silently
+// returns false there, which does not fail loudly: it means Claude's own
+// scratchpad stops being excluded and starts counting as the dev's work, and
+// `tool-results` shows up as their biggest project. A receipt that credits the
+// agent's temp files and drops the real commits is worse than no receipt.
+const WIN = process.platform === 'win32';
+// Separator normalization only — safe to hand back to git or print.
+function fwd(p) {
+  return String(p).replace(/\\/g, '/');
+}
+// Separator + case folding: for COMPARING paths, never for constructing them.
+// Lowercasing a path and then passing it to git would break a case-sensitive
+// checkout on a case-insensitive filesystem.
+function norm(p) {
+  const s = fwd(p);
+  return WIN ? s.toLowerCase() : s;
+}
+const HOME_N = norm(HOME);
+
+function isAgentMachinery(p) {
+  if (!p) return false;
+  const n = norm(p);
+  return (
+    // Agent scratchpad, under whichever temp root the platform uses:
+    // /tmp/claude-501/..., /private/tmp/claude-501/..., and on Windows
+    // C:/Users/me/AppData/Local/Temp/claude-501/...
+    /\/(?:private\/)?tmp\/claude-[^/]*\//.test(n) ||
+    /\/temp\/claude-[^/]*\//.test(n) ||
+    /\/var\/folders\/.*\/t\//i.test(n) || // macOS per-user temp
+    n.includes('/tool-results/') || // per-session tool output
+    // Trailing separator matters: without it this also swallows `~/.claude-foo`
+    // and `~/.claude.json`, which are somebody's actual projects and config.
+    n.startsWith(HOME_N + '/.claude/') || // memory, projects, config
+    // This report's own output. Left in, every run counts the last run's
+    // receipt as work and the dev's home directory grows a project made
+    // entirely of receipts about itself.
+    /\/claude-code-receipts-\d{4}-\d{2}-\d{2}-to-\d{4}-\d{2}-\d{2}\.(md|html)$/.test(n)
+  );
+}
+
+// git rev-parse is a subprocess; the corpus asks about the same handful of
+// directories tens of thousands of times, so memoize per directory.
+const _toplevelCache = new Map();
+function gitToplevel(dir) {
+  if (!dir) return null;
+  if (_toplevelCache.has(dir)) return _toplevelCache.get(dir);
+  let top = null;
+  try {
+    top = execFileSync('git', ['-C', dir, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+      timeout: 3000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() || null;
+  } catch {
+    top = null;
   }
-  if (cwd) byRepo[name].cwd.add(cwd);
-  return byRepo[name];
+  // A home directory under version control — the `git init ~` dotfiles habit —
+  // is not a project, and treating it as one is catastrophic: every directory
+  // beneath it stops resolving to itself and collapses into a single row named
+  // after the user's account. The whole point of resolving projects is undone.
+  // Same for a repo rooted at the filesystem root. Fall back to naming the
+  // directory.
+  //
+  // Compared through realpath, not as raw strings: `git rev-parse` resolves
+  // symlinks and `os.homedir()` doesn't, so on an automounted or migrated
+  // account (`/home/me` -> `/private/.../home/me`) a string compare misses and
+  // the collapse happens anyway.
+  if (top && (samePath(top, HOME) || top === path.parse(top).root)) top = null;
+  _toplevelCache.set(dir, top);
+  return top;
+}
+
+// True if two paths name the same directory, allowing for symlinks, separator
+// style and Windows case-insensitivity.
+function samePath(a, b) {
+  if (norm(a) === norm(b)) return true;
+  try {
+    return norm(fs.realpathSync(a)) === norm(fs.realpathSync(b));
+  } catch {
+    return false;
+  }
+}
+
+// A project name is the one piece of the dev's environment the report repeats
+// verbatim, so it gets bounded before it goes anywhere.
+//
+// Length: a directory name can be arbitrarily long and this lands in a 440px
+// receipt and in a prompt.
+//
+// Control characters: newlines and ANSI escapes in a name can restructure the
+// JSON the model reads, or the terminal it's printed in.
+//
+// It is NOT sanitized for meaning, and it can't be — a project genuinely named
+// "ignore previous instructions" is a valid directory name. Names are data,
+// never instructions; SKILL.md says so where the model reads them.
+function cleanProjectName(s) {
+  // The control-character class is written as escapes, never as literal
+  // bytes: a raw NUL or ESC pasted into source is invisible to the next
+  // reader and gets mangled by anything that rewrites the file.
+  const flat = String(s).replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').trim();
+  return flat.length > 64 ? flat.slice(0, 61) + '\u2026' : flat || '(unnamed)';
+}
+
+// Resolve a path to { key, dir } — the project it belongs to.
+//
+// A git repo is keyed by its root's name: `~/code/widget` -> `widget`.
+//
+// Work outside a repo is named for its directory, because it's still work and
+// dropping it would be worse than naming it. Under the home directory that's a
+// `~/`-relative path (`~/Downloads`, `~/notes/tax-2026`). Outside it, the last
+// two segments only (`/Volumes/AcmeCorp-NDA/merger-diligence` ->
+// `AcmeCorp-NDA/merger-diligence`), because a full absolute path is a map of
+// the dev's filesystem and the report doesn't need one.
+//
+// Be clear-eyed about what this does and doesn't do: it bounds the shape, it
+// does not anonymize. A directory name can itself be the sensitive thing, and
+// the last two segments of a client path still carry the client. That's why
+// Step 5 of SKILL.md reads the project names back to the user before the
+// report travels, and why `--repo` exists.
+const _projectCache = new Map();
+function projectForDir(dir) {
+  if (!dir || isAgentMachinery(dir + '/')) return null;
+  if (_projectCache.has(dir)) return _projectCache.get(dir);
+  const top = gitToplevel(dir);
+  let key;
+  if (top) {
+    key = path.basename(top);
+  } else {
+    // Compare through norm(), like every other path test here. A raw compare
+    // fails on Windows — `C:\Users\me\Downloads` never starts with
+    // `C:\Users\me` + `/` — and the failure isn't benign: the `~/` branch is
+    // what keeps the account name out of the row, so missing it prints
+    // `me/Downloads` instead of `~/Downloads`. (norm folds separators and
+    // case; symlinked homes are handled by samePath() in gitToplevel.)
+    const dirN = norm(dir);
+    if (dirN === HOME_N) key = '~';
+    else if (dirN.startsWith(HOME_N + '/')) key = '~' + fwd(dir).slice(HOME.length);
+    else key = path.posix.join(path.basename(path.dirname(dir)), path.basename(dir));
+  }
+  const out = { key: cleanProjectName(key), dir };
+  if (top) out.dir = top;
+  _projectCache.set(dir, out);
+  return out;
+}
+function projectForPath(p) {
+  if (!p || isAgentMachinery(p)) return null;
+  return projectForDir(path.dirname(p));
+}
+
+function repoBucket(key, dir) {
+  if (!byRepo[key]) byRepo[key] = { ...freshAgg(), cwd: new Set() };
+  if (dir) byRepo[key].cwd.add(dir);
+  return byRepo[key];
 }
 
 const files = findJsonlFiles(projectsDir);
 let filesScanned = 0;
 let linesScanned = 0;
 
-// A local YYYY-MM-DD calendar date. Matches what `git log --date=short`
-// prints, which is what active days are cross-referenced against.
-function localDay(d) {
-  const p = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
-}
-
 // A resumed session re-serializes its earlier entries into the new transcript,
 // so the same entry can appear in more than one file. Dedupe globally by uuid
 // or everything it carries (tool calls, files, lines, cost) counts twice.
 const seenUuids = new Set();
 
-// Merge two usage records from the same API response, field by field. In
-// practice every entry of a response repeats the identical usage, so any one
-// of them would do; taking the max is the safe reading either way, and holds
-// if a future format only puts the final counts on the last entry.
+// Merge two usage records from the same API response, field by field. Entries
+// of one response usually repeat the identical usage, but ~13% disagree on
+// output_tokens as the response streams — max picks the final total, and never
+// invents a combination that didn't occur.
 function maxUsage(a, b) {
   if (!a) return b;
   const out = { ...a };
   for (const k of Object.keys(b)) {
     if (typeof b[k] === 'number') out[k] = Math.max(a[k] || 0, b[k]);
+    // `cache_creation` is a nested object of per-TTL counts. Without this it
+    // would silently keep whichever entry arrived first.
+    else if (b[k] && typeof b[k] === 'object' && !Array.isArray(b[k])) {
+      out[k] = maxUsage(a[k], b[k]);
+    }
   }
   return out;
+}
+
+// Tools whose file_path is a read, not a write. These don't produce output,
+// but they say which project the session was working in — and reading is most
+// of what the work is.
+const FILE_READ_TOOLS = new Set(['Read', 'NotebookRead']);
+
+// --- Per-session collection -------------------------------------------------
+//
+// Everything is gathered per SESSION first, then attributed to projects once
+// the session's full picture is known. Subagents share their parent's
+// sessionId, so they land here automatically — a subagent's work ladders into
+// whatever its parent was doing, with no special case.
+const sessions = new Map();
+function session(sid) {
+  let S = sessions.get(sid);
+  if (!S) {
+    S = {
+      days: new Set(),
+      prompts: new Set(),
+      cwds: new Set(),
+      votes: new Map(), // projectKey -> touches, decides where this session's spend went
+      dirs: new Map(), // projectKey -> resolved dir
+      writes: [], // { path, lines, project }
+      costWeight: 0,
+      prCreateCmds: 0,
+      vote(p) {
+        const proj = projectForPath(p);
+        if (!proj) return null; // agent machinery — not work
+        this.votes.set(proj.key, (this.votes.get(proj.key) || 0) + 1);
+        this.dirs.set(proj.key, proj.dir);
+        return proj;
+      },
+      write(p, n) {
+        if (!p || !n) return;
+        const proj = this.vote(p);
+        if (!proj) return;
+        this.writes.push({ path: p, lines: n, project: proj.key });
+      },
+    };
+    sessions.set(sid, S);
+  }
+  return S;
 }
 
 for (const file of files) {
@@ -214,10 +497,33 @@ for (const file of files) {
   // content block — that share a requestId and each repeat the response's
   // usage. Group them here so the response's cost is charged exactly once;
   // counting per entry overstates it ~3x, and unevenly (responses with more
-  // tool calls have more entries), which would skew the category split.
-  const responses = new Map(); // requestId -> { usage, blocks, repo, sid }
+  // tool calls have more entries), which would skew every project's share.
+  const responses = new Map(); // requestId -> { usage, blocks, sid }
 
-  for (const line of content.split('\n')) {
+  const lines = content.split('\n');
+
+  // Pre-pass: which tool calls came back an error? A tool_result arrives after
+  // the tool_use it answers, so this can't be decided inline. An edit that was
+  // rejected or denied touched nothing and must not count as work.
+  const failedToolIds = new Set();
+  for (const line of lines) {
+    if (!line.trim() || !line.includes('is_error')) continue;
+    let o;
+    try {
+      o = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const c = o && o.message && o.message.content;
+    if (!Array.isArray(c)) continue;
+    for (const b of c) {
+      if (b && b.type === 'tool_result' && b.is_error && b.tool_use_id) {
+        failedToolIds.add(b.tool_use_id);
+      }
+    }
+  }
+
+  for (const line of lines) {
     if (!line.trim()) continue;
     linesScanned++;
     let obj;
@@ -237,36 +543,33 @@ for (const file of files) {
     }
 
     const cwd = obj.cwd;
-    if (args.repo && !(cwd || '').includes(args.repo)) continue;
 
     // Key active days by LOCAL calendar date. `git log --date=short` reports
     // author-local dates, so slicing the UTC timestamp would put an evening
     // session on the next day and stop it matching its own commits.
     const date = localDay(ts);
-    const repo = getRepo(cwd);
+    const sid = obj.sessionId || `file:${file}`;
+    const S = session(sid);
+    if (cwd) S.cwds.add(cwd);
+    S.days.add(date);
 
-    if (!overall.firstSeen || ts < overall.firstSeen) overall.firstSeen = ts;
-    if (!overall.lastSeen || ts > overall.lastSeen) overall.lastSeen = ts;
-
-    overall.activeDays.add(date);
-    repo.activeDays.add(date);
-
-    if (obj.sessionId) {
-      overall.sessions.add(obj.sessionId);
-      repo.sessions.add(obj.sessionId);
-    }
-
-    // Count real user turns (not tool-result-only echoes back to the model,
-    // and not sidechain turns — those are an orchestrator delegating to a
-    // subagent, not the human prompting Claude).
-    if (obj.type === 'user' && obj.message && obj.promptId && !obj.isSidechain) {
+    // Count real user turns. Tool-result echoes back to the model aren't
+    // prompts, and neither are interrupt markers or compaction summaries —
+    // those are transcript bookkeeping, not someone asking for something.
+    // A scheduled or queued invocation IS a prompt: the dev set it up, and
+    // its usage is theirs.
+    if (
+      obj.type === 'user' &&
+      obj.message &&
+      obj.promptId &&
+      !obj.isSidechain &&
+      !obj.isCompactSummary
+    ) {
       const c = obj.message.content;
       const isToolResultOnly =
         Array.isArray(c) && c.length > 0 && c.every((b) => b && b.type === 'tool_result');
-      if (!isToolResultOnly) {
-        overall.prompts.add(obj.promptId);
-        repo.prompts.add(obj.promptId);
-      }
+      const isInterrupt = typeof c === 'string' && /^\[Request interrupted/.test(c);
+      if (!isToolResultOnly && !isInterrupt) S.prompts.add(obj.promptId);
     }
 
     if (obj.type === 'assistant' && obj.message) {
@@ -276,7 +579,7 @@ for (const file of files) {
       // per response, after the file is read — see the `responses` loop below.
       const rid = obj.requestId || (obj.message && obj.message.id) || obj.uuid;
       if (rid) {
-        const r = responses.get(rid) || { usage: null, blocks: [], repo, sid: obj.sessionId };
+        const r = responses.get(rid) || { usage: null, blocks: [], sid };
         if (obj.message.usage) r.usage = maxUsage(r.usage, obj.message.usage);
         for (const b of blocks) if (b && b.type === 'tool_use') r.blocks.push(b);
         responses.set(rid, r);
@@ -286,84 +589,147 @@ for (const file of files) {
         if (!b || b.type !== 'tool_use') continue;
         const name = b.name || 'Unknown';
         const input = b.input || {};
+        // A tool_use block is an ATTEMPT. If its result came back an error —
+        // a rejected edit, a denied write, a stale read — nothing was touched,
+        // and counting it credits work that never happened.
+        if (b.id && failedToolIds.has(b.id)) continue;
+
+        // Every file path this session touched, read or write, votes on which
+        // project the session's spend belongs to. Reading a repo to answer a
+        // question is work in that repo.
+        const readPath = FILE_READ_TOOLS.has(name) ? input.file_path || input.notebook_path : null;
+        if (readPath) S.vote(readPath);
+
+        // NotebookEdit carries `notebook_path`, not `file_path` — reading only
+        // file_path counted a notebook's lines while never counting the
+        // notebook itself.
+        const p = input.file_path || input.notebook_path;
         if (name === 'Edit' || name === 'NotebookEdit') {
-          if (input.file_path) {
-            overall.filesTouched.add(input.file_path);
-            repo.filesTouched.add(input.file_path);
-          }
           const n = Math.max(
             countLines(input.old_string ?? input.old_source),
             countLines(input.new_string ?? input.new_source)
           );
-          overall.linesTouched += n;
-          repo.linesTouched += n;
+          S.write(p, n);
         } else if (name === 'MultiEdit') {
-          if (input.file_path) {
-            overall.filesTouched.add(input.file_path);
-            repo.filesTouched.add(input.file_path);
-          }
+          let n = 0;
           for (const e of input.edits || []) {
-            const n = Math.max(countLines(e.old_string), countLines(e.new_string));
-            overall.linesTouched += n;
-            repo.linesTouched += n;
+            n += Math.max(countLines(e.old_string), countLines(e.new_string));
           }
+          S.write(p, n);
         } else if (name === 'Write') {
-          if (input.file_path) {
-            overall.filesTouched.add(input.file_path);
-            repo.filesTouched.add(input.file_path);
-          }
-          const n = countLines(input.content);
-          overall.linesTouched += n;
-          repo.linesTouched += n;
+          S.write(p, countLines(input.content));
         } else if (name === 'Bash') {
           const cmd = input.command || '';
-          // Anchored to the start of a command so prose containing the words
-          // "git commit" doesn't count. `m` and the newline/`then` separators
-          // matter: multi-line blocks and guarded one-liners are the common
-          // shapes. Any intervening tokens are allowed, to cover
-          // pre-subcommand options whose values hold `/` or `=` (`git -C
-          // <path> commit`, `git -c key=value commit`). (?=\s|$) rather than
-          // \b, since \b also matches "commit-tree"/"commit-graph".
-          if (CMD_GIT_COMMIT.test(cmd)) {
-            overall.gitCommitCmds++;
-            repo.gitCommitCmds++;
-          }
-          if (CMD_GH_PR_CREATE.test(cmd)) {
-            overall.prCreateCmds++;
-            repo.prCreateCmds++;
-          }
+          if (runsCommand(CMD_GH_PR_CREATE, cmd)) S.prCreateCmds++;
         }
       }
     }
   }
 
-  // Charge each API response's relative cost once, spread across the
-  // categories of the tool calls it made. A response with no tool calls
-  // (Claude thinking or writing a reply — e.g. the wrap-up after a batch of
-  // edits) folds into the session's most recent category rather than becoming
-  // a bucket of its own. Map iteration is insertion order, so sessions still
-  // advance chronologically.
+  // Charge each API response's relative cost once, onto its session. Where it
+  // goes from there is decided later, by which projects the session touched —
+  // never by which tool happened to fire on this turn.
   for (const r of responses.values()) {
     if (!r.usage) continue;
-    const w = RELATIVE_TOKEN_WEIGHTS;
-    const weight =
-      (r.usage.input_tokens || 0) * w.input +
-      (r.usage.output_tokens || 0) * w.output +
-      (r.usage.cache_creation_input_tokens || 0) * w.cacheCreation +
-      (r.usage.cache_read_input_tokens || 0) * w.cacheRead;
-    r.repo.costWeight += weight;
-    if (r.blocks.length === 0) {
-      const cat = lastCategoryBySession.get(r.sid) || DEFAULT_CATEGORY;
-      overall.categoryCost[cat] = (overall.categoryCost[cat] || 0) + weight;
-    } else {
-      const share = weight / r.blocks.length;
-      for (const b of r.blocks) {
-        const cat = categoryForTool(b.name || 'Unknown');
-        overall.categoryCost[cat] = (overall.categoryCost[cat] || 0) + share;
-        lastCategoryBySession.set(r.sid, cat);
-      }
-    }
+    session(r.sid).costWeight += weighUsage(r.usage);
   }
+}
+
+// --- Attribute each session's work to the projects it touched ---------------
+//
+// A session's spend goes where its work went, split across projects in
+// proportion to how much it touched each. The shell's cwd is a fallback, not
+// evidence: a session run from the home directory that spent an hour editing
+// one repo belongs to that repo, not to "home".
+// `--repo <substr>` scopes the whole report to matching projects. It filters
+// on the resolved project, not the session's cwd: the point is to leave other
+// projects' names out of a report someone is about to send onward, and a cwd
+// match would still let a session running from elsewhere drag them in.
+const matchesFilter = (key) =>
+  !args.repo || key.toLowerCase().includes(args.repo.toLowerCase());
+
+for (const S of sessions.values()) {
+  // Files land in their own project, wherever the session was sitting.
+  for (const wr of S.writes) {
+    if (!matchesFilter(wr.project)) continue;
+    const r = repoBucket(wr.project, S.dirs.get(wr.project));
+    r.filesTouched.add(wr.path);
+    r.linesTouched += wr.lines;
+    overall.filesTouched.add(wr.path);
+    overall.linesTouched += wr.lines;
+  }
+
+  let allVotes = [...S.votes.entries()];
+
+  // A session that touched no files still did work — it searched the web, read
+  // Slack, queried a dashboard. Where does that belong?
+  //
+  // If it ran inside a repo, the cwd is real evidence: the dev was sitting in
+  // that project, investigating it. Attribute it there.
+  //
+  // Otherwise there is no project, and saying so is more honest than inventing
+  // one. Bucketing it under the home directory would dress "unknown" up as a
+  // project name and make the dev's shell location the biggest row in a report
+  // about their work. Research is a real category of work; it just doesn't
+  // live anywhere on disk.
+  //
+  // Work out where the session belongs BEFORE applying --repo. Deciding the
+  // home first and filtering second is what keeps the filter honest: filtering
+  // first lets a session whose real project was excluded fall through to some
+  // other bucket, which is how `--repo project` ended up *growing* the research
+  // row — "Research & investigation (no project)" contains the substring, so
+  // sessions belonging to filtered-out repos were relabelled as research. A
+  // filter must only ever remove.
+  if (!allVotes.length) {
+    // Dedupe by project key: several cwds can resolve to one repo, and an
+    // undeduped list would hand that repo the session's whole-number counts
+    // once per cwd.
+    const seenKeys = new Set();
+    for (const cwd of S.cwds) {
+      const proj = projectForDir(cwd);
+      if (!proj || !gitToplevel(cwd) || seenKeys.has(proj.key)) continue;
+      seenKeys.add(proj.key);
+      allVotes.push([proj.key, 1]);
+      S.dirs.set(proj.key, proj.dir);
+    }
+    // Only genuinely project-less work becomes research. A session that HAS a
+    // project which --repo excluded is out of scope, not research.
+    if (!allVotes.length) allVotes = [[NO_PROJECT, 1]];
+  }
+
+  // The session's home, decided on the full picture.
+  const mainProject = allVotes.reduce((a, b) => (b[1] > a[1] ? b : a))[0];
+
+  const votes = allVotes.filter(([k]) => matchesFilter(k));
+  if (!votes.length) continue; // nothing of this session is in scope
+
+  const totalVotes = votes.reduce((a, [, n]) => a + n, 0);
+
+  for (const [key, n] of votes) {
+    const frac = n / totalVotes;
+    const r = repoBucket(key, S.dirs.get(key));
+    r.costWeight += S.costWeight * frac;
+    // Counts of things that happened once go to the session's main project
+    // whole — splitting an integer proportionally and rounding each share
+    // breaks the column (one command across two projects rounds to 1+1=2,
+    // across three to 0+0+0). And they go there only if that really is the
+    // main project: crediting them to whichever row survived the filter would
+    // move another project's commits onto this one.
+    if (key === mainProject) {
+      r.prCreateCmds += S.prCreateCmds;
+    }
+    // Days and sessions are memberships, not quantities — a session that spans
+    // two projects was genuinely in both, so both rows show it. These columns
+    // therefore don't sum to the report totals, and the report says so.
+    for (const d of S.days) r.activeDays.add(d);
+    r.sessions.add(S);
+    for (const p of S.prompts) r.prompts.add(p);
+  }
+
+  for (const d of S.days) overall.activeDays.add(d);
+  overall.sessions.add(S);
+  for (const p of S.prompts) overall.prompts.add(p);
+  overall.prCreateCmds += S.prCreateCmds;
 }
 
 // --- Local git cross-reference (no network) ---
@@ -383,67 +749,161 @@ function gitUserName() {
   }
 }
 
-// For each repo dir we saw activity in, list commits authored by this user
-// since the cutoff (sha + date), so we can both count them and de-duplicate
-// across repos. Best-effort; failures are silent (not a git repo, no email
-// configured, etc).
-function gitCommits(cwd, sinceDate) {
-  try {
-    const email = execFileSync('git', ['-C', cwd, 'config', 'user.email'], {
-      encoding: 'utf8',
-      timeout: 3000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    if (!email) return null;
-    const out = execFileSync(
-      'git',
-      ['-C', cwd, 'log', `--since=${sinceDate}`, `--author=${email}`, '--date=short', '--pretty=format:%H %ad'],
-      { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }
-    );
-    return out
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => {
-        const sp = line.indexOf(' ');
-        return { sha: line.slice(0, sp), date: line.slice(sp + 1) };
-      });
-  } catch {
-    return null;
+// Commits in this repo that contain work Claude Code did.
+//
+// NOT "commits by my git identity" — that asks a different question and gets a
+// different answer. It counts anything committed under the dev's email,
+// including a snapshot cron, a release bot, or a formatter running on their
+// behalf; and it silently misses nothing they did by hand. What this report
+// cares about is whether the work CC produced actually landed. So: intersect
+// each commit's changed files with the files CC touched. A commit qualifies if
+// it carries at least one of them.
+//
+// That join is bot-proof by construction (a cron's files were never touched by
+// CC) and it still catches the commit the dev made by hand in their terminal
+// after CC wrote the code — which is the case an identity match gets right by
+// accident and a "commits CC itself ran" match misses entirely.
+// Returns an array of commits, or GIT_UNAVAILABLE when git couldn't answer —
+// which is NOT the same as "no commits" and must not be rendered as one.
+const GIT_UNAVAILABLE = Symbol('git-unavailable');
+
+function gitCommitsWithOurWork(dir, ourFiles) {
+  if (!ourFiles.size) return null;
+  const top = gitToplevel(dir);
+  if (!top) return null;
+  // Resolved per repo, so an includeIf work identity is picked up where it
+  // applies rather than being missed by a single global lookup.
+  const ourEmail = gitUserEmailFor(top);
+  if (!ourEmail) return null;
+  // Ask git only about the files CC touched, via a pathspec, and let git do the
+  // intersection against its own index. `:(literal)` disables globbing —
+  // without it a real filename containing `?` or `*` becomes a wildcard and
+  // matches siblings CC never touched, inventing work out of punctuation.
+  //
+  // Both sides go through norm() before comparing. `git rev-parse` answers with
+  // forward slashes even on Windows, where the transcript paths use
+  // backslashes — a raw compare matches nothing there, `rel` comes back empty,
+  // and every project silently reports no commits. And the pathspec itself must
+  // use forward slashes: git treats `\` inside `:(literal)` as a literal
+  // character, so a backslash path matches no file and exits 0 — a wrong answer
+  // with no error to notice.
+  const topN = norm(top);
+  const rel = [];
+  for (const f of ourFiles) {
+    const slashed = fwd(f); // original case — this is handed to git
+    if (!norm(slashed).startsWith(topN + '/')) continue;
+    rel.push(':(literal)' + slashed.slice(topN.length + 1));
   }
+  if (!rel.length) return null;
+
+  // A repo with no commits yet makes `git log` exit non-zero. That's an empty
+  // history, not a broken one — it means zero commits, and reporting it as
+  // "couldn't read git" would be its own small lie.
+  try {
+    execFileSync('git', ['-C', top, 'rev-parse', '--verify', '-q', 'HEAD'], {
+      timeout: 3000,
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+  } catch {
+    return [];
+  }
+  // Paths go on argv, so a big enough set throws E2BIG — which the catch below
+  // would otherwise report as "no commits". Chunk it. (`git log` has no
+  // --pathspec-from-file; that's an `add`/`commit` flag only.)
+  const CHUNK = 400;
+  const byShaLocal = new Map();
+  for (let i = 0; i < rel.length; i += CHUNK) {
+    try {
+      // No `--since`. It prunes traversal rather than filtering, and its
+      // tolerance is a fixed commit slop, not a date distance — so an in-window
+      // commit sitting behind a run of older ones is unreachable at ANY floor.
+      // The pathspec already narrows the walk to a handful of files, so walking
+      // full history for them is cheap; the date filter happens below.
+      const out = execFileSync(
+        'git',
+        [
+          '-C', top, 'log', '--no-merges',
+          '--pretty=format:%H %cI %ae', '--', ...rel.slice(i, i + CHUNK),
+        ],
+        { encoding: 'utf8', timeout: 20000, maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
+      );
+      for (const line of out.split('\n')) {
+        if (!line.trim()) continue;
+        const [sha, when, ...emailParts] = line.trim().split(' ');
+        // %cI, matching what a window means for a receipt: the commit LANDED in
+        // this period. (%aI is when it was first written, which for a rebase or
+        // a cherry-pick is a different, older date.)
+        const ts = new Date(when);
+        if (isNaN(ts) || ts < cutoff || ts > now) continue;
+        // BOTH signals are required, and neither is sufficient alone. Identity
+        // alone counts a snapshot cron or a release bot running under the dev's
+        // email. The pathspec alone counts every unrelated bot commit that
+        // happens to touch a file the dev also touched — a bump job editing the
+        // same manifest, say. Together: work the dev committed, that CC did.
+        //
+        // %ae is the AUTHOR, not the committer: if a colleague wrote it and the
+        // dev merely applied the patch, it isn't the dev's work.
+        if (emailParts.join(' ') !== ourEmail) continue;
+        byShaLocal.set(sha, localDay(ts));
+      }
+    } catch {
+      // Git errored — a promisor fetch failure, a timeout, a corrupt object.
+      // The honest answer is "couldn't tell", not "none".
+      return GIT_UNAVAILABLE;
+    }
+  }
+  return [...byShaLocal].map(([sha, date]) => ({ sha, date }));
 }
 
-// Resolve the shared `.git` dir for a worktree. Multiple "repos" (by basename)
-// can be worktrees of the same checkout — `git log` on each only sees commits
-// reachable from that worktree's branch, but branches can share ancestor
-// commits, so naively summing per-repo commit counts can double-count. We
-// flag repos that share a common-dir so the report can caveat this, and we
-// de-duplicate the global total by commit SHA regardless.
-function gitCommonDir(cwd) {
+// The identity git would sign a commit with IN THIS REPO — the same question
+// git itself answers, resolved the same way.
+//
+// Not `--global`: the standard corporate split puts the work identity behind
+// `includeIf "gitdir:~/work/"`, which `--global` cannot see, so it comes back
+// empty and every commit in the report vanishes for exactly the people most
+// likely to need one. Not the repo's raw `--local` either — asked from inside
+// the repo, plain `git config` resolves includeIf, local overrides and global
+// defaults in git's own precedence order.
+//
+// A shared or bot identity configured in some repo is not a hazard here: the
+// file intersection is the real guard, and a release bot's commits don't touch
+// the files Claude Code edited.
+const _emailCache = new Map();
+function gitUserEmailFor(dir) {
+  const key = dir || '';
+  if (_emailCache.has(key)) return _emailCache.get(key);
+  let email = null;
   try {
-    const out = execFileSync('git', ['-C', cwd, 'rev-parse', '--git-common-dir'], {
-      encoding: 'utf8',
-      timeout: 3000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    return out ? path.resolve(cwd, out) : null;
+    email =
+      execFileSync('git', dir ? ['-C', dir, 'config', 'user.email'] : ['config', 'user.email'], {
+        encoding: 'utf8',
+        timeout: 3000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim() || null;
   } catch {
-    return null;
+    email = null;
   }
+  _emailCache.set(key, email);
+  return email;
 }
 
-// Local, not UTC: this is handed to `git log --since=`, which reads it in
-// local time, and it's the date printed on the receipt.
+// Local, not UTC: the date printed on the receipt, and the floor for the git
+// walk below.
 const sinceDate = localDay(cutoff);
 const repoSummaries = {};
-const globalCommits = new Map(); // sha -> date, deduped across all repos
-const commonDirCounts = new Map(); // git-common-dir -> number of repos sharing it
+const globalCommits = new Map(); // sha -> date, deduped across worktrees
 let anyGitData = false;
 
+let anyGitError = false;
+
 for (const [name, agg] of Object.entries(byRepo)) {
-  const cwd = [...agg.cwd][0];
-  const commits = cwd ? gitCommits(cwd, sinceDate) : null;
-  const commonDir = cwd ? gitCommonDir(cwd) : null;
-  if (commonDir) commonDirCounts.set(commonDir, (commonDirCounts.get(commonDir) || 0) + 1);
+  const dir = [...agg.cwd][0];
+  // Only ask git about projects that ARE git repos, and only about the files
+  // CC actually touched there.
+  const raw = dir ? gitCommitsWithOurWork(dir, agg.filesTouched) : null;
+  const gitFailed = raw === GIT_UNAVAILABLE;
+  if (gitFailed) anyGitError = true;
+  const commits = gitFailed ? null : raw;
 
   let gitActiveDayOverlap = null;
   if (commits) {
@@ -460,23 +920,22 @@ for (const [name, agg] of Object.entries(byRepo)) {
     activeDays: agg.activeDays.size,
     filesTouched: agg.filesTouched.size,
     linesTouched: agg.linesTouched,
-    gitCommitCmds: agg.gitCommitCmds,
-    prCreateCmds: agg.prCreateCmds,
-    gitCommitsByYou: commits ? commits.length : null,
+    prCreateCmds: Math.round(agg.prCreateCmds),
+    // null, not false, for the research bucket — it isn't a repo, but it isn't
+    // a directory either, and `false` makes the renderer footnote it as "work
+    // done in a plain directory", which is untrue of the biggest row on the page.
+    isRepo: name === NO_PROJECT ? null : !!(dir && gitToplevel(dir)),
+    commitsWithOurWork: commits ? commits.length : null,
+    // True when git was asked and couldn't answer. Distinct from a null count
+    // meaning "not a repo" or "nothing landed" — the renderer must not report
+    // a failure as a zero.
+    gitUnavailable: gitFailed || undefined,
     gitActiveDayOverlap,
-    _commonDir: commonDir, // stripped before output, below
     _costWeight: agg.costWeight, // stripped after pctSpend is computed, below
     _activeDays: agg.activeDays, // stripped after the rollup unions them, below
+    _prompts: agg.prompts, // ditto — prompts are a Set and must union, not sum
     _shas: commits ? commits.map((c) => c.sha) : null, // ditto — see the rollup
   };
-}
-
-// Mark repos that share git history with another repo in this report — their
-// per-repo commit counts may overlap (the global total below is de-duplicated
-// by commit SHA, so it's accurate even when this is true).
-for (const r of Object.values(repoSummaries)) {
-  if (r._commonDir && commonDirCounts.get(r._commonDir) > 1) r.sharedGitHistory = true;
-  delete r._commonDir;
 }
 
 // Each repo's share of total relative compute (see RELATIVE_TOKEN_WEIGHTS) —
@@ -497,9 +956,8 @@ const WORTH_NAMING_PCT = 1;
 const hasOutput = ([, r]) =>
   r.filesTouched > 0 ||
   r.linesTouched > 0 ||
-  r.gitCommitCmds > 0 ||
   r.prCreateCmds > 0 ||
-  r.gitCommitsByYou ||
+  r.commitsWithOurWork ||
   r.pctSpend >= WORTH_NAMING_PCT;
 const sortedRepos = Object.entries(repoSummaries)
   .filter(hasOutput)
@@ -512,39 +970,42 @@ const otherRepos = [
 if (otherRepos.length) {
   const rollup = {
     sessions: 0, prompts: 0, activeDays: 0, filesTouched: 0, linesTouched: 0,
-    gitCommitCmds: 0, prCreateCmds: 0, gitCommitsByYou: null, pctSpend: 0, repoCount: otherRepos.length,
+    prCreateCmds: 0, isRepo: null,
+    commitsWithOurWork: null, gitActiveDayOverlap: null, pctSpend: 0,
+    projectCount: otherRepos.length,
   };
-  // Active days and commits are UNIONS, not sums. One day worked across three
-  // of these repos is one active day. And worktrees of the same checkout each
-  // report the same shared ancestor commits, so adding their counts inflates
-  // the row — dedupe by SHA, exactly as the report-wide total does.
+  // Days, prompts and commits are UNIONS, not sums. One day worked across three
+  // of these projects is one active day; one prompt that touched three of them
+  // is one prompt. And worktrees of the same checkout each report the same
+  // shared ancestor commits, so adding their counts inflates the row — dedupe
+  // by SHA, exactly as the report-wide total does.
   const rollupDays = new Set();
+  const rollupPrompts = new Set();
   const rollupShas = new Set();
   let anyRollupGit = false;
   for (const [, r] of otherRepos) {
     rollup.sessions += r.sessions;
-    rollup.prompts += r.prompts;
     rollup.filesTouched += r.filesTouched;
     rollup.linesTouched += r.linesTouched;
-    rollup.gitCommitCmds += r.gitCommitCmds;
     rollup.prCreateCmds += r.prCreateCmds;
     rollup.pctSpend += r.pctSpend;
     for (const d of r._activeDays) rollupDays.add(d);
+    for (const p of r._prompts) rollupPrompts.add(p);
     if (r._shas) {
       anyRollupGit = true;
       for (const s of r._shas) rollupShas.add(s);
     }
   }
   rollup.activeDays = rollupDays.size;
-  rollup.gitCommitsByYou = anyRollupGit ? rollupShas.size : null;
+  rollup.prompts = rollupPrompts.size;
+  rollup.commitsWithOurWork = anyRollupGit ? rollupShas.size : null;
   topRepos['(other repos)'] = rollup;
 }
 
-const totalCalendarDays = Math.max(1, Math.round((now - cutoff) / 86400000));
+const totalCalendarDays = calendarDaysBetween(cutoff, now);
 
-// Global commit total: de-duplicated by SHA across all repos (see gitCommonDir
-// above — worktrees of the same repo would otherwise double-count shared
-// ancestor commits).
+// Report-wide commit total: de-duplicated by SHA, since worktrees of one
+// checkout each report the same shared ancestor commits.
 const gitCommitDates = new Set(globalCommits.values());
 let gitActiveDayOverlapTotal = 0;
 for (const d of overall.activeDays) if (gitCommitDates.has(d)) gitActiveDayOverlapTotal++;
@@ -566,19 +1027,27 @@ const summary = {
     calendarDays: totalCalendarDays,
     filesTouched: overall.filesTouched.size,
     linesTouched: overall.linesTouched,
-    gitCommitCmds: overall.gitCommitCmds,
-    prCreateCmds: overall.prCreateCmds,
-    // De-duplicated by commit SHA across repos (see gitCommonDir). Per-repo
-    // gitCommitsByYou figures are NOT deduplicated and may sum to more than this.
-    gitCommitsByYou: anyGitData ? globalCommits.size : null,
+    prCreateCmds: Math.round(overall.prCreateCmds),
+    // Commits whose changed files include something CC touched — de-duplicated
+    // by SHA, since worktrees of one checkout share ancestors.
+    commitsWithOurWork: anyGitData ? globalCommits.size : null,
     gitActiveDayOverlap: anyGitData ? gitActiveDayOverlapTotal : null,
-    // Relative cost weight per activity category (unitless — see
-    // RELATIVE_TOKEN_WEIGHTS). Use categoryBreakdown()/the HTML bars to turn
-    // this into percentages; don't sum these into a dollar figure.
+    // Why the commit count is null, when it is. These are NOT the same thing
+    // and must never be reported as each other: a month spent entirely on
+    // research legitimately has no commits, and telling that dev "git couldn't
+    // be read" is a specific, checkable, false claim about their machine — on
+    // a page whose whole argument is that its numbers are careful.
+    //   false -> no project produced commits (research, non-repo work, or a
+    //            new checkout). An honest zero.
+    //   true  -> at least one project's git actually errored. Unknown.
+    gitUnavailable: anyGitError || undefined,
     // firstSeen/lastSeen are deliberately not emitted: nothing in the report
     // uses them, and the exact instant of a dev's first and last turn is a
     // working-hours signal that has no business in a spend receipt.
-    categoryCost: overall.categoryCost,
+    //
+    // Nor is any activity/category breakdown — see the note above
+    // RELATIVE_TOKEN_WEIGHTS for why per-tool spend attribution isn't a
+    // measurement. Spend appears once, per project, as byRepo[].pctSpend.
   },
   byRepo: topRepos,
 };
@@ -588,6 +1057,7 @@ const summary = {
 // survive until now, but they must not reach the output.
 for (const r of Object.values(topRepos)) {
   delete r._activeDays;
+  delete r._prompts;
   delete r._shas;
 }
 
@@ -596,7 +1066,26 @@ process.stdout.write(JSON.stringify(summary, null, 2));
 // --- Optional HTML "receipt" ---
 if (args.html) {
   try {
-    fs.writeFileSync(args.html, renderHTML(summary));
+    // Mode 0600, and refuse to follow a symlink. The receipt names the dev's
+    // projects, and the obvious place to put it is a predictable path in a
+    // world-writable /tmp: on a shared box — a dev server, a CI runner —
+    // anyone can pre-create that name as a link to a file they want the
+    // victim to overwrite, or simply read the receipt afterwards. `wx` fails
+    // rather than following an existing link; the unlink-and-retry keeps
+    // re-runs working for a file we really did write.
+    const write = () =>
+      fs.writeFileSync(args.html, renderHTML(summary), { mode: 0o600, flag: 'wx' });
+    try {
+      write();
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      const st = fs.lstatSync(args.html);
+      if (st.isSymbolicLink()) {
+        throw new Error(`${args.html} is a symlink; refusing to write through it`);
+      }
+      fs.unlinkSync(args.html);
+      write();
+    }
   } catch (e) {
     process.stderr.write(`\n(failed to write HTML receipt: ${e.message})\n`);
   }
@@ -609,48 +1098,103 @@ function escapeHtml(s) {
 }
 
 function fmt(n) {
+  if (n == null || !Number.isFinite(Number(n))) return '–';
   return Number(n).toLocaleString('en-US');
 }
 
 function fmtPct(pct) {
   if (pct <= 0) return '–';
-  if (pct < 1) return '<1%';
+  if (pct < 1) return '&lt;1%'; // escaped: this is interpolated straight into HTML
   return `${Math.round(pct)}%`;
 }
 
-// Turn the relative cost-weight map into percentages for the bars. Weights
-// are unitless (see RELATIVE_TOKEN_WEIGHTS) — only their proportions matter.
-function categoryBreakdown(categoryCost) {
-  const total = Object.values(categoryCost).reduce((a, b) => a + b, 0) || 1;
-  return Object.entries(categoryCost)
-    .map(([label, weight]) => ({ label, pct: (100 * weight) / total }))
-    .filter((c) => c.pct > 0)
-    .sort((a, b) => b.pct - a.pct);
+// --- CSV export -------------------------------------------------------------
+
+// One CSV cell.
+//
+// Two separate jobs. The RFC-4180 part — quote anything containing a comma,
+// quote or newline, and double the quotes — is ordinary. The leading-character
+// check is the important one: a cell starting `=`, `+`, `-` or `@` is a FORMULA
+// to Excel, Sheets and LibreOffice. Project names come from directory names, so
+// a folder called `=cmd|'/c calc'!A1` becomes executable the moment someone
+// opens the export — and this file is built to be handed to someone else.
+// Prefixing with an apostrophe makes the spreadsheet read it as text.
+function csvCell(v) {
+  let s = v === null || v === undefined ? '' : String(v);
+  if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  if (/[",\n\r]/.test(s)) s = '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+
+function buildCsv(s) {
+  const rows = [
+    ['Project', 'Sessions', 'Active days', 'Files touched', 'Lines touched', 'Commits', 'Spend %'],
+  ];
+  for (const [name, r] of Object.entries(s.byRepo)) {
+    rows.push([
+      name,
+      r.sessions,
+      r.activeDays,
+      r.filesTouched,
+      r.linesTouched,
+      // Preserve the same three-way distinction the table makes: a number, a
+      // known absence, or genuinely unknown. Blanks in a spreadsheet read as
+      // zero, and "git failed" is not zero.
+      r.gitUnavailable ? 'unknown' : r.commitsWithOurWork === null ? 'n/a' : r.commitsWithOurWork,
+      r.pctSpend.toFixed(1),
+    ]);
+  }
+  // The HTML footnotes travel with the table; a CSV arrives naked, in a tool
+  // whose first instinct is =SUM() on a column. Sessions and Active days
+  // deliberately don't sum — a session spanning two projects is counted in
+  // both — so a recipient summing them overstates and never finds out. Carry
+  // the caveat into the file rather than leaving it behind in the page.
+  rows.push([]);
+  rows.push([
+    'Note: Sessions and Active days count a project each time work touched it, so a session' +
+      ' spanning two projects appears in both rows — these columns do NOT sum to your totals.' +
+      ' Neither does Commits: worktrees of one repo share history, so a commit can appear in' +
+      ' more than one row, and the report total de-duplicates by commit. Files and lines belong' +
+      ' to one project each and do sum. Spend % sums to 100 before rounding.' +
+      ' "n/a" = not a git repo or nothing landed; "unknown" = git could not be read.',
+  ]);
+  return rows.map((r) => r.map(csvCell).join(',')).join('\r\n');
+}
+
+// Embed a string in a <script> safely: `</script>` inside a JS string literal
+// still closes the tag, because the HTML parser doesn't know it's in a string.
+// U+2028/U+2029 too — JSON.stringify leaves them raw, and they were illegal in
+// JS string literals before ES2019. Harmless in a current browser, free to fix,
+// and a receipt can outlive the engine that opens it.
+function jsonForScript(v) {
+  return JSON.stringify(v)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 function renderHTML(s) {
   const t = s.totals;
-  const cats = categoryBreakdown(t.categoryCost);
 
   const repoEntries = Object.entries(s.byRepo);
-  let anySharedGitHistory = false;
-  let anyCmdFallback = false;
+  let anyNotRepo = false;
+  let anyGitUnavailable = false;
   const repoRows = repoEntries
     .map(([name, r]) => {
       let commits;
-      if (r.gitCommitsByYou != null) {
-        commits = fmt(r.gitCommitsByYou) + (r.sharedGitHistory ? '†' : '');
-        if (r.sharedGitHistory) anySharedGitHistory = true;
-      } else if (r.gitCommitCmds > 0) {
-        commits = `~${fmt(r.gitCommitCmds)}*`;
-        anyCmdFallback = true;
+      if (r.gitUnavailable) {
+        commits = '?';
+        anyGitUnavailable = true;
       } else {
-        commits = '–';
+        commits = r.commitsWithOurWork != null ? fmt(r.commitsWithOurWork) : '–';
       }
+      if (r.isRepo === false) anyNotRepo = true;
       return `
       <tr>
-        <td>${escapeHtml(name)}</td>
+        <td>${escapeHtml(name)}${r.isRepo === false ? '*' : ''}</td>
         <td class="num">${fmt(r.sessions)}</td>
+        <td class="num">${fmt(r.activeDays)}</td>
         <td class="num">${fmt(r.filesTouched)}</td>
         <td class="num">${fmt(r.linesTouched)}</td>
         <td class="num">${commits}</td>
@@ -659,24 +1203,59 @@ function renderHTML(s) {
     })
     .join('');
   const repoFootnotes = [
-    anySharedGitHistory && '† shares commit history with another project here (worktrees of the same repo) — the total above is de-duplicated by commit, but these per-repo counts may overlap.',
-    anyCmdFallback && '* git history unavailable for this project; based on `git commit` commands run in Claude Code sessions instead.',
+    'Sessions and active days count a project each time work touched it, so a session spanning two projects appears in both rows. Commits can repeat too: worktrees of one repo share history, and the total above de-duplicates by commit. None of those three columns sum to the totals. Files and lines belong to one project each and do.',
+    anyNotRepo && '* not a git repository — work done in a plain directory, named for it.',
+    '– no commits containing this project’s Claude Code work, or not a git repository.',
+    anyGitUnavailable && '? git couldn’t be read for this project, so its commits are unknown — not zero.',
   ].filter(Boolean).map(t => `<div class="note">${escapeHtml(t)}</div>`).join('');
 
-  const barRows = cats
-    .map(
-      (c) => `
-      <div class="bar-row">
-        <div class="bar-label"><span>${escapeHtml(c.label)}</span><span>${c.pct.toFixed(0)}%</span></div>
-        <div class="bar-track"><div class="bar-fill" style="width:${c.pct.toFixed(1)}%"></div></div>
-      </div>`
-    )
-    .join('');
 
-  const shipped = (t.gitCommitsByYou || 0) + (t.prCreateCmds || 0);
-  const overlapNote = t.gitActiveDayOverlap != null
-    ? `${fmt(t.gitActiveDayOverlap)} of your ${fmt(t.activeDays)} active days also had a git commit in one of these projects.`
-    : null;
+  // The hero number. It is computed here, in code, from figures that are
+  // already scoped to work Claude Code did — commits carrying CC's own changes,
+  // PRs CC opened. It must never be assembled from a raw identity-wide count:
+  // this box is the largest type on a page designed to be handed to someone,
+  // and it is generated before any model sees the data, so no instruction
+  // written for the model can protect it. Whatever guards this number has to
+  // live right here.
+  //
+  // `commitsWithOurWork` is null in two unrelated cases, and `null || 0` would
+  // flatten both to "you shipped 0" in the largest type on the page. Keep them
+  // apart: git ERRORING means unknown (say so), while a month with no commits
+  // is an honest zero and must not be dressed up as a tool failure — telling a
+  // researcher their git is broken when it isn't is exactly the kind of
+  // checkable false claim this report can't afford.
+  // FOUR states. A null commit count has more than one cause and only one of
+  // them is a failure; collapsing them is how this line has now been wrong
+  // twice, in both directions.
+  //
+  //   commits known, git fine      -> the plain sum
+  //   commits known, git broke too -> the sum is a floor, say so
+  //   commits null, git broke      -> PRs only; commits UNKNOWN, not zero
+  //   commits null, git fine       -> PRs only; there was simply nothing to
+  //                                   check — no repos in the window, or no
+  //                                   git identity configured. NOT a failure.
+  //                                   Telling a dev whose month was research
+  //                                   in plain directories that their git is
+  //                                   broken is a false claim about their
+  //                                   machine, which is the whole thing this
+  //                                   report can't afford to do.
+  const commitsKnown = t.commitsWithOurWork != null;
+  const gitBroke = !!t.gitUnavailable;
+  const shipped = commitsKnown
+    ? (t.commitsWithOurWork || 0) + (t.prCreateCmds || 0)
+    : t.prCreateCmds || 0;
+  const shippedLabel = commitsKnown ? 'Commits + PRs shipped' : 'PRs shipped';
+  const shippedNote = !commitsKnown
+    ? gitBroke
+      ? 'Git couldn’t be read, so commits carrying this work are unknown — not zero.'
+      : 'No git repositories to check this window, so there are no commits to count.'
+    : gitBroke
+      ? 'At least this many: git couldn’t be read for some projects, so any commits there are missing from this count.'
+      : null;
+  const overlapNote =
+    t.gitActiveDayOverlap != null
+      ? `${fmt(t.gitActiveDayOverlap)} of your ${fmt(t.activeDays)} active days ended with work Claude Code did being committed.`
+      : null;
 
   return `<!doctype html>
 <html lang="en">
@@ -696,12 +1275,31 @@ function renderHTML(s) {
     color: var(--ink);
     display:flex; justify-content:center; align-items:flex-start;
   }
-  .receipt {
-    background: var(--paper);
+  /* The shadow lives on the wrapper, not the receipt: a mask clips box-shadow
+     along with everything else, so the torn edge would cut its own shadow off.
+     drop-shadow on a parent traces the masked silhouette instead. */
+  .receipt-wrap {
     width: 100%; max-width: 440px;
-    padding: 2rem 1.75rem 1.5rem;
-    box-shadow: 0 12px 32px rgba(0,0,0,0.18);
-    border-radius: 2px;
+    filter: drop-shadow(0 10px 22px rgba(0,0,0,0.20));
+  }
+  .receipt {
+    --tooth: 13px;  /* width of one perforation triangle */
+    --notch: 7px;   /* how deep it bites into the paper */
+    background: var(--paper);
+    width: 100%;
+    /* Pad by the notch depth so the teeth chew into margin, not into text. */
+    padding: calc(1.5rem + var(--notch)) 1.75rem calc(1.25rem + var(--notch));
+    /* Torn-off top and bottom edges. Two tiled conic gradients cut the
+       triangles; the linear gradient keeps everything between them opaque. */
+    --torn:
+      conic-gradient(from 135deg at top, #0000, #000 1deg 89deg, #0000 90deg)
+        top / var(--tooth) var(--notch) repeat-x,
+      conic-gradient(from -45deg at bottom, #0000, #000 1deg 89deg, #0000 90deg)
+        bottom / var(--tooth) var(--notch) repeat-x,
+      linear-gradient(#000 0 0)
+        center / 100% calc(100% - 2 * var(--notch)) no-repeat;
+    -webkit-mask: var(--torn);
+    mask: var(--torn);
   }
   h1 { text-align:center; font-size:1rem; letter-spacing:0.25em; margin:0; font-weight:700; }
   h2 { font-size:0.7rem; letter-spacing:0.15em; text-transform:uppercase; color:var(--muted); margin: 1.25rem 0 0.6rem; font-weight:700; }
@@ -718,52 +1316,97 @@ function renderHTML(s) {
     padding: 0.6rem 0; margin: 1rem 0; text-transform:uppercase;
   }
   .total .value { color: var(--accent); font-size:1.3rem; }
-  .bar-row { margin: 0.55rem 0; }
-  .bar-label { display:flex; justify-content:space-between; font-size:0.72rem; margin-bottom:0.25rem; }
-  .bar-track { background:#efece4; border-radius:3px; height:7px; overflow:hidden; }
-  .bar-fill { background: var(--accent); height:100%; border-radius:3px; }
   table { width:100%; table-layout:fixed; border-collapse:collapse; font-size:0.65rem; }
   th, td { text-align:left; padding:0.3rem 0.2rem; border-bottom:1px dotted var(--line); overflow-wrap:break-word; }
-  th:first-child, td:first-child { width:30%; }
-  th { font-weight:700; color: var(--muted); text-transform:uppercase; font-size:0.6rem; letter-spacing:0.04em; }
+  /* Seven columns in a 440px receipt: budget the widths explicitly rather than
+     letting them divide evenly, which leaves each number column too narrow for
+     its own heading and breaks "SESSIONS" into "SESSIO / NS". */
+  col.c-project { width:26%; }
+  col.c-sess    { width:9%;  }
+  col.c-days    { width:8%;  }
+  col.c-files   { width:11%; }
+  /* Lines is the column that actually gets big — a heavy month reaches seven
+     digits. Commits almost never passes three, so it lends its width here. */
+  col.c-lines   { width:18%; }
+  col.c-cmts    { width:14%; }
+  col.c-spend   { width:14%; }
+  th { font-weight:700; color: var(--muted); text-transform:uppercase; font-size:0.58rem; letter-spacing:0.02em; }
+  /* Headings are abbreviated to fit; never let one hyphenate mid-word. */
+  th.num { white-space:nowrap; }
   td.num, th.num { text-align:right; }
-  td.num { white-space:nowrap; }
+  /* nowrap keeps "1,234,567" on one line, but with table-layout:fixed a number
+     wider than its column paints straight over the neighbouring one instead of
+     stopping. A heavy user's million-line month is enough to make the Files and
+     Lines columns collide. Clip at the cell edge; the ellipsis says the value
+     was cut rather than silently wrong. */
+  td.num { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .barcode {
     height: 36px; margin: 1.25rem 0 0.75rem;
     background: repeating-linear-gradient(90deg, var(--ink) 0 2px, transparent 2px 4px, var(--ink) 4px 5px, transparent 5px 9px, var(--ink) 9px 12px, transparent 12px 14px);
     opacity: 0.85;
   }
   .footer { text-align:center; font-size:0.65rem; color:var(--muted); line-height:1.6; }
-  .footer a { color: inherit; }
+  .actions { margin-top: 0.9rem; text-align: center; }
+  .export {
+    font: inherit; font-size: 0.62rem; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--muted); background: none; cursor: pointer;
+    border: 1px dashed var(--line); border-radius: 2px; padding: 0.4rem 0.9rem;
+  }
+  .export:hover { color: var(--ink); border-color: var(--muted); }
+  .export:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* This gets printed and PDF'd — it is a receipt. Two things have to go for
+     that to work.
+
+     A drop-shadow filter forces the whole receipt to rasterize in paged
+     output: the PDF comes out as a 450KB bitmap with zero embedded fonts, so
+     nothing is selectable, searchable, or readable by a screen reader.
+     Without it: vector text, a quarter the size.
+
+     The torn edge re-cuts at every page break, so a two-page receipt appears
+     to end mid-sentence behind a row of perforations. Print it as plain paper
+     and let the page boundary be a page boundary. */
+  @media print {
+    body { background: #fff; padding: 0; display: block; }
+    .receipt-wrap { filter: none; max-width: none; }
+    .receipt { -webkit-mask: none; mask: none; padding: 0; }
+    tr, .row { break-inside: avoid; }
+    .actions { display: none; }
+  }
   .note { font-size:0.68rem; color:var(--muted); line-height:1.5; margin-top:0.4rem; }
 </style>
 </head>
 <body>
+  <div class="receipt-wrap">
   <div class="receipt">
     <h1>Claude Code</h1>
     <div class="stars">★ ★ ★ ★ ★</div>
     <div class="sub">USAGE RECEIPT${s.userName ? ` — ${escapeHtml(s.userName)}` : ''}</div>
-    <div class="sub">${escapeHtml(s.since)} — ${escapeHtml(s.until)} (${t.activeDays} of ${t.calendarDays} days active)</div>
+    <div class="sub">${escapeHtml(s.since)} — ${escapeHtml(s.until)} (${fmt(t.activeDays)} of ${fmt(t.calendarDays)} days active)</div>
     <hr>
     <div class="row"><span class="label">Sessions</span><span class="value">${fmt(t.sessions)}</span></div>
     <div class="row"><span class="label">Prompts</span><span class="value">${fmt(t.prompts)}</span></div>
     <div class="row"><span class="label">Files touched</span><span class="value">${fmt(t.filesTouched)}</span></div>
     <div class="row"><span class="label">Lines touched (approx.)</span><span class="value">${fmt(t.linesTouched)}</span></div>
-    ${t.gitCommitsByYou != null ? `<div class="row"><span class="label">Git commits</span><span class="value">${fmt(t.gitCommitsByYou)}</span></div>` : ''}
+    ${t.commitsWithOurWork != null ? `<div class="row"><span class="label">Commits carrying that work</span><span class="value">${fmt(t.commitsWithOurWork)}</span></div>` : ''}
     ${t.prCreateCmds ? `<div class="row"><span class="label">PRs opened</span><span class="value">${fmt(t.prCreateCmds)}</span></div>` : ''}
-    <div class="total"><span>Commits + PRs shipped</span><span class="value">${fmt(shipped)}</span></div>
-    <div class="note">Commits in projects you used Claude Code in, plus PRs opened via Claude Code, this window. Commits aren't all individually CC-attributed.${overlapNote ? ` ${escapeHtml(overlapNote)}` : ''}</div>
+    <div class="total"><span>${escapeHtml(shippedLabel)}</span><span class="value">${fmt(shipped)}</span></div>
+    <div class="note">${shippedNote ? `${escapeHtml(shippedNote)} ` : 'Commits whose changed files include work Claude Code did, plus PRs it opened. Commits made by anyone else, or by automation running under your name, are not counted. '}${overlapNote ? escapeHtml(overlapNote) : ''}</div>
 
-    <h2>Where the spend went</h2>
-    ${barRows}
-    <div class="note">Relative share of compute, weighted by token cost (output tokens count ~5x input; cached tokens count less) — not a dollar figure, and not the same as a count of tool calls.</div>
-
-    <h2>Top projects</h2>
+    <h2>By project</h2>
     <table>
-      <thead><tr><th>Project</th><th class="num">Sessions</th><th class="num">Files</th><th class="num">Lines</th><th class="num">Commits</th><th class="num">% Spend</th></tr></thead>
+      <colgroup>
+        <col class="c-project"><col class="c-sess"><col class="c-days"><col class="c-files">
+        <col class="c-lines"><col class="c-cmts"><col class="c-spend">
+      </colgroup>
+      <thead><tr><th>Project</th><th class="num">Sess</th><th class="num">Days</th><th class="num">Files</th><th class="num">Lines</th><th class="num">Commits</th><th class="num">Spend</th></tr></thead>
       <tbody>${repoRows}</tbody>
     </table>
     ${repoFootnotes}
+
+    <div class="actions">
+      <button type="button" class="export" id="export-csv">Export CSV</button>
+    </div>
 
     <div class="barcode"></div>
     <div class="footer">
@@ -772,6 +1415,33 @@ function renderHTML(s) {
       ${escapeHtml(s.generatedAt)}
     </div>
   </div>
+  </div>
+<script>
+// The CSV is built by the miner and embedded verbatim — the same numbers the
+// page shows, escaped and formula-neutralized once, in one place. Rebuilding it
+// here by scraping the DOM would be a second implementation to keep in step.
+(function () {
+  var csv = ${jsonForScript(buildCsv(s))};
+  var name = ${jsonForScript(`claude-code-receipt-${s.since}-to-${s.until}.csv`)};
+  var btn = document.getElementById('export-csv');
+  if (!btn) return;
+  btn.addEventListener('click', function () {
+    // A BOM, so Excel reads it as UTF-8 rather than mangling any non-ASCII
+    // project name.
+    var blob = new Blob(['\\ufeff' + csv], { type: 'text/csv;charset=utf-8' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    // Deferred, not immediate: Safari has historically aborted the download
+    // when the blob URL is revoked in the same task as the click.
+    setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+  });
+})();
+</script>
 </body>
 </html>`;
 }
