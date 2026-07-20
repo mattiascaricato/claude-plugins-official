@@ -2070,6 +2070,20 @@
       "homepage": "https://miro.com"
     },
     {
+      "name": "modern-web-guidance",
+      "description": "Keep your coding agent up to date with the latest web best practices",
+      "author": {
+        "name": "Google Chrome"
+      },
+      "category": "development",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/GoogleChrome/modern-web-guidance.git",
+        "sha": "2354c8c5856602e0730d7c65d91f1c29ffc479ee"
+      },
+      "homepage": "https://goo.gle/modern-web-guidance"
+    },
+    {
       "name": "monday-crm",
       "description": "Run your monday CRM in plain language. Build a pipeline from scratch, start the day with a ranked deal briefing, spin up a forecast dashboard, audit board health, clean up messy data in bulk, and turn meeting notes into deal updates. Every skill writes back into monday as a real update, doc, or dashboard. Built on the official monday MCP connector.",
       "author": {
