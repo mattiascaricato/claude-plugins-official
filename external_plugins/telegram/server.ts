@@ -528,8 +528,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+        // Fall back to the topic of the replied-to message — the model
+        // omitting message_thread_id must not silently post to General.
         const message_thread_id =
-          args.message_thread_id != null ? Number(args.message_thread_id) : undefined
+          args.message_thread_id != null
+            ? Number(args.message_thread_id)
+            : args.reply_to != null
+              ? topicByMessage.get(`${args.chat_id as string}:${Number(args.reply_to)}`)
+              : undefined
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
@@ -907,6 +913,20 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
+// Topic of each inbound forum-topic message, keyed "chat_id:message_id".
+// Lets reply infer the topic from reply_to when the model omits
+// message_thread_id — otherwise the reply silently lands in General.
+// Bounded FIFO; Maps iterate in insertion order.
+const TOPIC_BY_MESSAGE_MAX = 1000
+const topicByMessage = new Map<string, number>()
+function rememberTopic(chat_id: string, message_id: number, thread_id: number) {
+  if (topicByMessage.size >= TOPIC_BY_MESSAGE_MAX) {
+    const oldest = topicByMessage.keys().next().value
+    if (oldest != null) topicByMessage.delete(oldest)
+  }
+  topicByMessage.set(`${chat_id}:${message_id}`, thread_id)
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -959,6 +979,7 @@ async function handleInbound(
     ctx.message?.is_topic_message && ctx.message.message_thread_id != null
       ? ctx.message.message_thread_id
       : undefined
+  if (topicThreadId != null && msgId != null) rememberTopic(chat_id, msgId, topicThreadId)
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
   // Without message_thread_id, forum groups show it against General.
