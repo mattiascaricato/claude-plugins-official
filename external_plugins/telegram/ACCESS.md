@@ -61,7 +61,7 @@ With the default `requireMention: true`, the bot responds only when @mentioned o
 
 **Privacy mode.** Telegram bots default to a server-side privacy mode that filters group messages before they reach your code: only @mentions and replies are delivered. This matches the default `requireMention: true`, so it's normally invisible. Using `--no-mention` requires disabling privacy mode as well: message [@BotFather](https://t.me/BotFather), send `/setprivacy`, pick your bot, choose **Disable**. Without that step, Telegram never delivers the messages regardless of local config.
 
-**Forum topics.** In supergroups with topics enabled, inbound topic messages carry `message_thread_id` in the channel meta and replies can target the originating topic. Permission prompts are the exception: they always go to allowlisted DMs, never to the group or its topics — group members haven't passed pairing, so approve/deny stays with paired users only. Expect permission requests in your DM with the bot even when the conversation lives in a topic.
+**Forum topics.** In supergroups with topics enabled, inbound topic messages carry `message_thread_id` in the channel meta and replies can target the originating topic. Permission prompts default to allowlisted DMs, never the group or its topics — group members haven't passed pairing, so approve/deny stays with paired users only. For single-member groups, `permissionDelivery: context` posts prompts to the chat and topic of the most recent inbound message instead (falling back to DMs on failure). Approve/deny taps are allowlist-gated wherever the prompt is posted, but prompt contents (tool name, and input preview after "See more") become visible to anyone in the group — only enable `context` when that's acceptable.
 
 ## Mention detection
 
@@ -93,6 +93,12 @@ Configure outbound behavior with `/telegram:access set <key> <value>`.
 **`textChunkLimit`** sets the split threshold. Telegram rejects messages over 4096 characters.
 
 **`chunkMode`** chooses the split strategy: `length` cuts exactly at the limit; `newline` prefers paragraph boundaries.
+
+**`permissionDelivery`** controls where permission prompts are posted. `dm` (default) sends to every allowlisted DM. `context` sends to the chat and forum topic of the most recent inbound message, falling back to DMs if that send fails. See the forum-topics note above for the visibility trade-off.
+
+```
+/telegram:access set permissionDelivery context
+```
 
 ## Skill reference
 

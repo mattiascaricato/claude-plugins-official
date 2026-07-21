@@ -114,6 +114,13 @@ type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
+  /**
+   * Where permission prompts go. 'dm' (default): all allowlisted DMs.
+   * 'context': the chat + forum topic of the most recent inbound message,
+   * falling back to DMs. Button taps are allowlist-gated either way; only
+   * enable 'context' in groups where every member may see prompt contents.
+   */
+  permissionDelivery?: 'dm' | 'context'
 }
 
 function defaultAccess(): Access {
@@ -158,6 +165,7 @@ function readAccessFile(): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      permissionDelivery: parsed.permissionDelivery,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -434,11 +442,34 @@ mcp.setNotificationHandler(
       .text('See more', `perm:more:${request_id}`)
       .text('✅ Allow', `perm:allow:${request_id}`)
       .text('❌ Deny', `perm:deny:${request_id}`)
-    for (const chat_id of access.allowFrom) {
-      void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
-        process.stderr.write(`permission_request send to ${chat_id} failed: ${e}\n`)
-      })
+    const sendToDms = () => {
+      for (const chat_id of access.allowFrom) {
+        void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
+          process.stderr.write(`permission_request send to ${chat_id} failed: ${e}\n`)
+        })
+      }
     }
+    // 'context' delivery: the session doesn't tell us which conversation
+    // triggered the request, so route to the most recent inbound's chat +
+    // topic — right whenever the prompt follows the instruction just sent.
+    // Taps stay allowlist-gated regardless of where the prompt is posted.
+    if (access.permissionDelivery === 'context' && lastInbound != null) {
+      void bot.api
+        .sendMessage(lastInbound.chat_id, text, {
+          reply_markup: keyboard,
+          ...(lastInbound.thread_id != null
+            ? { message_thread_id: lastInbound.thread_id }
+            : {}),
+        })
+        .catch(e => {
+          process.stderr.write(
+            `permission_request context send to ${lastInbound?.chat_id} failed, falling back to DMs: ${e}\n`,
+          )
+          sendToDms()
+        })
+      return
+    }
+    sendToDms()
   },
 )
 
@@ -919,6 +950,10 @@ function safeName(s: string | undefined): string | undefined {
 // Bounded FIFO; Maps iterate in insertion order.
 const TOPIC_BY_MESSAGE_MAX = 1000
 const topicByMessage = new Map<string, number>()
+
+// Chat + topic of the most recent gated inbound message. Used by
+// permissionDelivery: 'context' to post prompts where the user last spoke.
+let lastInbound: { chat_id: string; thread_id?: number } | null = null
 function rememberTopic(chat_id: string, message_id: number, thread_id: number) {
   if (topicByMessage.size >= TOPIC_BY_MESSAGE_MAX) {
     const oldest = topicByMessage.keys().next().value
@@ -980,6 +1015,10 @@ async function handleInbound(
       ? ctx.message.message_thread_id
       : undefined
   if (topicThreadId != null && msgId != null) rememberTopic(chat_id, msgId, topicThreadId)
+  lastInbound = {
+    chat_id,
+    ...(topicThreadId != null ? { thread_id: topicThreadId } : {}),
+  }
 
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
   // Without message_thread_id, forum groups show it against General.
