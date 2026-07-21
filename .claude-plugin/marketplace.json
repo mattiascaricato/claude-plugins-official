@@ -2070,6 +2070,20 @@
       "homepage": "https://miro.com"
     },
     {
+      "name": "mlflow",
+      "description": "Skills for tracing, evaluating, and improving AI agents with MLflow. Supports the full agent improvement loop: instrument → trace → evaluate → iterate → validate.",
+      "author": {
+        "name": "MLflow Team"
+      },
+      "category": "monitoring",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/mlflow/skills.git",
+        "sha": "c33bb3d303a2c6113bbaed6dbfe756e88e80f1df"
+      },
+      "homepage": "https://mlflow.org/"
+    },
+    {
       "name": "monday-crm",
       "description": "Run your monday CRM in plain language. Build a pipeline from scratch, start the day with a ranked deal briefing, spin up a forecast dashboard, audit board health, clean up messy data in bulk, and turn meeting notes into deal updates. Every skill writes back into monday as a real update, doc, or dashboard. Built on the official monday MCP connector.",
       "author": {
