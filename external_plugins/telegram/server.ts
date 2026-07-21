@@ -114,6 +114,13 @@ type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
+  /**
+   * Where permission prompts go. 'dm' (default): all allowlisted DMs.
+   * 'context': the chat + forum topic of the most recent inbound message,
+   * falling back to DMs. Button taps are allowlist-gated either way; only
+   * enable 'context' in groups where every member may see prompt contents.
+   */
+  permissionDelivery?: 'dm' | 'context'
 }
 
 function defaultAccess(): Access {
@@ -158,6 +165,7 @@ function readAccessFile(): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      permissionDelivery: parsed.permissionDelivery,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -434,11 +442,34 @@ mcp.setNotificationHandler(
       .text('See more', `perm:more:${request_id}`)
       .text('✅ Allow', `perm:allow:${request_id}`)
       .text('❌ Deny', `perm:deny:${request_id}`)
-    for (const chat_id of access.allowFrom) {
-      void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
-        process.stderr.write(`permission_request send to ${chat_id} failed: ${e}\n`)
-      })
+    const sendToDms = () => {
+      for (const chat_id of access.allowFrom) {
+        void bot.api.sendMessage(chat_id, text, { reply_markup: keyboard }).catch(e => {
+          process.stderr.write(`permission_request send to ${chat_id} failed: ${e}\n`)
+        })
+      }
     }
+    // 'context' delivery: the session doesn't tell us which conversation
+    // triggered the request, so route to the most recent inbound's chat +
+    // topic — right whenever the prompt follows the instruction just sent.
+    // Taps stay allowlist-gated regardless of where the prompt is posted.
+    if (access.permissionDelivery === 'context' && lastInbound != null) {
+      void bot.api
+        .sendMessage(lastInbound.chat_id, text, {
+          reply_markup: keyboard,
+          ...(lastInbound.thread_id != null
+            ? { message_thread_id: lastInbound.thread_id }
+            : {}),
+        })
+        .catch(e => {
+          process.stderr.write(
+            `permission_request context send to ${lastInbound?.chat_id} failed, falling back to DMs: ${e}\n`,
+          )
+          sendToDms()
+        })
+      return
+    }
+    sendToDms()
   },
 )
 
@@ -447,7 +478,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, and files (absolute paths) to attach images or documents.',
+        'Reply on Telegram. Pass chat_id from the inbound message. Optionally pass reply_to (message_id) for threading, message_thread_id to post into a forum topic, and files (absolute paths) to attach images or documents.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -456,6 +487,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           reply_to: {
             type: 'string',
             description: 'Message ID to thread under. Use message_id from the inbound <channel> block.',
+          },
+          message_thread_id: {
+            type: 'string',
+            description: 'Forum topic to post into. Use message_thread_id from the inbound <channel> block. Omit for DMs and non-forum groups.',
           },
           files: {
             type: 'array',
@@ -524,6 +559,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chat_id = args.chat_id as string
         const text = args.text as string
         const reply_to = args.reply_to != null ? Number(args.reply_to) : undefined
+        // Fall back to the topic of the replied-to message — the model
+        // omitting message_thread_id must not silently post to General.
+        const message_thread_id =
+          args.message_thread_id != null
+            ? Number(args.message_thread_id)
+            : args.reply_to != null
+              ? topicByMessage.get(`${args.chat_id as string}:${Number(args.reply_to)}`)
+              : undefined
         const files = (args.files as string[] | undefined) ?? []
         const format = (args.format as string | undefined) ?? 'text'
         const parseMode = format === 'markdownv2' ? 'MarkdownV2' as const : undefined
@@ -553,6 +596,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               (replyMode === 'all' || i === 0)
             const sent = await bot.api.sendMessage(chat_id, chunks[i], {
               ...(shouldReplyTo ? { reply_parameters: { message_id: reply_to } } : {}),
+              ...(message_thread_id != null ? { message_thread_id } : {}),
               ...(parseMode ? { parse_mode: parseMode } : {}),
             })
             sentIds.push(sent.message_id)
@@ -569,9 +613,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         for (const f of files) {
           const ext = extname(f).toLowerCase()
           const input = new InputFile(f)
-          const opts = reply_to != null && replyMode !== 'off'
-            ? { reply_parameters: { message_id: reply_to } }
-            : undefined
+          const opts = {
+            ...(reply_to != null && replyMode !== 'off'
+              ? { reply_parameters: { message_id: reply_to } }
+              : {}),
+            ...(message_thread_id != null ? { message_thread_id } : {}),
+          }
           if (PHOTO_EXTS.has(ext)) {
             const sent = await bot.api.sendPhoto(chat_id, input, opts)
             sentIds.push(sent.message_id)
@@ -897,6 +944,24 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
+// Topic of each inbound forum-topic message, keyed "chat_id:message_id".
+// Lets reply infer the topic from reply_to when the model omits
+// message_thread_id — otherwise the reply silently lands in General.
+// Bounded FIFO; Maps iterate in insertion order.
+const TOPIC_BY_MESSAGE_MAX = 1000
+const topicByMessage = new Map<string, number>()
+
+// Chat + topic of the most recent gated inbound message. Used by
+// permissionDelivery: 'context' to post prompts where the user last spoke.
+let lastInbound: { chat_id: string; thread_id?: number } | null = null
+function rememberTopic(chat_id: string, message_id: number, thread_id: number) {
+  if (topicByMessage.size >= TOPIC_BY_MESSAGE_MAX) {
+    const oldest = topicByMessage.keys().next().value
+    if (oldest != null) topicByMessage.delete(oldest)
+  }
+  topicByMessage.set(`${chat_id}:${message_id}`, thread_id)
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -942,8 +1007,26 @@ async function handleInbound(
     return
   }
 
+  // Forum-topic thread id, when the message came from a topic (gated on
+  // is_topic_message — message_thread_id also appears on non-topic comment
+  // threads). Used for the typing indicator and surfaced in inbound meta.
+  const topicThreadId =
+    ctx.message?.is_topic_message && ctx.message.message_thread_id != null
+      ? ctx.message.message_thread_id
+      : undefined
+  if (topicThreadId != null && msgId != null) rememberTopic(chat_id, msgId, topicThreadId)
+  lastInbound = {
+    chat_id,
+    ...(topicThreadId != null ? { thread_id: topicThreadId } : {}),
+  }
+
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  // Without message_thread_id, forum groups show it against General.
+  void bot.api
+    .sendChatAction(chat_id, 'typing', {
+      ...(topicThreadId != null ? { message_thread_id: topicThreadId } : {}),
+    })
+    .catch(() => {})
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
@@ -969,6 +1052,8 @@ async function handleInbound(
         ...(msgId != null ? { message_id: String(msgId) } : {}),
         user: from.username ?? String(from.id),
         user_id: String(from.id),
+        // Surface the topic's thread id so replies can target the same topic.
+        ...(topicThreadId != null ? { message_thread_id: String(topicThreadId) } : {}),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
         ...(imagePath ? { image_path: imagePath } : {}),
         ...(attachment ? {
