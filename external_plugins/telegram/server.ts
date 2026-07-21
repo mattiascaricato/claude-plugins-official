@@ -952,8 +952,21 @@ async function handleInbound(
     return
   }
 
+  // Forum-topic thread id, when the message came from a topic (gated on
+  // is_topic_message — message_thread_id also appears on non-topic comment
+  // threads). Used for the typing indicator and surfaced in inbound meta.
+  const topicThreadId =
+    ctx.message?.is_topic_message && ctx.message.message_thread_id != null
+      ? ctx.message.message_thread_id
+      : undefined
+
   // Typing indicator — signals "processing" until we reply (or ~5s elapses).
-  void bot.api.sendChatAction(chat_id, 'typing').catch(() => {})
+  // Without message_thread_id, forum groups show it against General.
+  void bot.api
+    .sendChatAction(chat_id, 'typing', {
+      ...(topicThreadId != null ? { message_thread_id: topicThreadId } : {}),
+    })
+    .catch(() => {})
 
   // Ack reaction — lets the user know we're processing. Fire-and-forget.
   // Telegram only accepts a fixed emoji whitelist — if the user configures
@@ -979,12 +992,8 @@ async function handleInbound(
         ...(msgId != null ? { message_id: String(msgId) } : {}),
         user: from.username ?? String(from.id),
         user_id: String(from.id),
-        // Forum-topic messages carry the topic's thread id; surface it so
-        // replies can target the same topic (gated on is_topic_message —
-        // message_thread_id also appears on non-topic comment threads).
-        ...(ctx.message?.is_topic_message && ctx.message.message_thread_id != null
-          ? { message_thread_id: String(ctx.message.message_thread_id) }
-          : {}),
+        // Surface the topic's thread id so replies can target the same topic.
+        ...(topicThreadId != null ? { message_thread_id: String(topicThreadId) } : {}),
         ts: new Date((ctx.message?.date ?? 0) * 1000).toISOString(),
         ...(imagePath ? { image_path: imagePath } : {}),
         ...(attachment ? {
