@@ -61,6 +61,8 @@ With the default `requireMention: true`, the bot responds only when @mentioned o
 
 **Privacy mode.** Telegram bots default to a server-side privacy mode that filters group messages before they reach your code: only @mentions and replies are delivered. This matches the default `requireMention: true`, so it's normally invisible. Using `--no-mention` requires disabling privacy mode as well: message [@BotFather](https://t.me/BotFather), send `/setprivacy`, pick your bot, choose **Disable**. Without that step, Telegram never delivers the messages regardless of local config.
 
+**Forum topics.** In supergroups with topics enabled, inbound topic messages carry `message_thread_id` in the channel meta and replies can target the originating topic. Permission prompts are the exception: they always go to allowlisted DMs, never to the group or its topics — group members haven't passed pairing, so approve/deny stays with paired users only. Expect permission requests in your DM with the bot even when the conversation lives in a topic.
+
 ## Mention detection
 
 In groups with `requireMention: true`, any of the following triggers the bot:
